@@ -293,7 +293,7 @@ static inline bool NextPosition(int64_t N, const int64_t* shape, int64_t* dims) 
 }
 
 template <typename T>
-void Im2col<T, StorageOrder::NCHW>::operator() (
+void Im2col<T, StorageOrder::NCHW>::operator()(
     const T* data_im,
     int64_t channels,
     int64_t height,
@@ -362,7 +362,7 @@ void Im2col<T, StorageOrder::NCHW>::operator() (
 }
 
 template <typename T>
-void Im2col<T, StorageOrder::NCHW>::operator() (
+void Im2col<T, StorageOrder::NCHW>::operator()(
     const T* data_im,
     const int64_t* im_shape,
     const int64_t* output_shape,
@@ -380,7 +380,7 @@ void Im2col<T, StorageOrder::NCHW>::operator() (
 }
 
 template <typename T>
-void Im2col<T, StorageOrder::NCHW>::operator() (
+void Im2col<T, StorageOrder::NCHW>::operator()(
     const T* data_im,
     const int64_t* im_shape,
     const int64_t* output_shape,
@@ -394,13 +394,12 @@ void Im2col<T, StorageOrder::NCHW>::operator() (
     concurrency::ThreadPool* tp,
     bool accumulate_output,
     T padding_value) {
-
   const int64_t kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
   const auto output_size = std::accumulate(output_shape, output_shape + rank, 1LL, std::multiplies<int64_t>());
 
   constexpr int64_t cost_per_batch = 4864;
   const auto total_cost = output_size * (rank + 1) * channels_col;
-  const auto batches = total_cost / cost_per_batch + 1; 
+  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
 
   auto channel_proc = [=](ptrdiff_t c_col) {
     // Loop over spatial axes in reverse order to compute a per-axis offset.
@@ -694,7 +693,6 @@ void Col2imPar<float, StorageOrder::NCHW>(const float* data_col, int64_t channel
                                           int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
                                           int64_t stride_w, float* data_im, CPUMathUtil* context,
                                           ThreadPool* tp) {
-
   const int64_t output_h =
       (height + pad_b + pad_t - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
   const int64_t output_w =
@@ -702,10 +700,11 @@ void Col2imPar<float, StorageOrder::NCHW>(const float* data_col, int64_t channel
   const int64_t output_hw = output_h * output_w;
   const int64_t hw = height * width;
   const int64_t hwc = hw * channels;
-  const auto data_per_channel = kernel_h * kernel_w * output_hw;
 
-  constexpr int64_t cost_per_batch = 4864;  // Experimentally found number
-  const auto batches = (data_per_channel * channels) / cost_per_batch + 1;
+  constexpr int64_t cost_per_batch = 4864;                        // Experimentally found number
+  const auto data_per_channel = kernel_h * kernel_w * output_hw;  // From the loops below
+  const auto total_cost = data_per_channel * channels;
+  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
 
   Set<float, CPUMathUtil>(gsl::narrow<ptrdiff_t>(hwc), 0, data_im, context);
 
@@ -748,7 +747,7 @@ void Col2imPar<float, StorageOrder::NCHW>(const float* data_col, int64_t channel
 
   // Fallback
   const int64_t h_offset_step = dilation_h * width;
-  // for (auto* dst = data_im; dst < dst_end; dst += hw) 
+  // for (auto* dst = data_im; dst < dst_end; dst += hw)
   auto fallback_channel_proc = [=](ptrdiff_t channel) {
     // compute src start for this channel
     const auto* src = data_col + channel * data_per_channel;
@@ -786,19 +785,6 @@ void Col2imPar<float, StorageOrder::NCHW>(const float* data_col, int64_t channel
 }
 
 template <>
-void Col2im<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, int64_t channels, int64_t height,
-                                                    int64_t width, int64_t kernel_h, int64_t kernel_w,
-                                                    int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
-                                                    int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
-                                                    int64_t stride_w, float* data_im, CPUMathUtil* context) {
-  Col2imPar<float, StorageOrder::NCHW>(data_col, channels, height,
-                                       width, kernel_h, kernel_w,
-                                       dilation_h, dilation_w, pad_t,
-                                       pad_l, pad_b, pad_r, stride_h,
-                                       stride_w, data_im, context, nullptr);
-}
-
-template <>
 void Col2im<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_col, int64_t channels, int64_t height,
                                                     int64_t width, int64_t kernel_h, int64_t kernel_w,
                                                     int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
@@ -832,11 +818,11 @@ void Col2im<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_col, int64
 }
 
 template <>
-void Col2imNd<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, const int64_t* img_shape,
-                                                      const int64_t* output_shape, int64_t channels_col, int64_t img_size,
-                                                      const int64_t* kernel_shape, const int64_t* stride,
-                                                      const int64_t* dilation, const int64_t* pad, ptrdiff_t N,
-                                                      float* data_img, CPUMathUtil* context) {
+void Col2imNdPar<float, StorageOrder::NCHW>(const float* data_col, const int64_t* img_shape,
+                                            const int64_t* output_shape, int64_t channels_col, int64_t img_size,
+                                            const int64_t* kernel_shape, const int64_t* stride,
+                                            const int64_t* dilation, const int64_t* pad, ptrdiff_t N,
+                                            float* data_img, CPUMathUtil* context, ThreadPool* tp) {
   Set<float, CPUMathUtil>(gsl::narrow<ptrdiff_t>(img_size), 0, data_img, context);
   Im2col<float, StorageOrder::NCHW>()(
       data_col,
@@ -849,6 +835,7 @@ void Col2imNd<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, con
       pad,
       N,
       data_img,
+      tp,
       true);
 }
 

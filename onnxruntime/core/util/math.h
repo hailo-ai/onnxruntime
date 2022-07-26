@@ -294,6 +294,22 @@ void Col2imNd(
     T* data_img,
     Provider* provider);
 
+template <typename T, int order>
+void Col2imNdPar(
+    const T* data_col,
+    const int64_t* img_shape,
+    const int64_t* output_shape,
+    int64_t channels_col,
+    int64_t img_size,
+    const int64_t* kernel_shape,
+    const int64_t* stride,
+    const int64_t* dilation,
+    const int64_t* pad,
+    ptrdiff_t N,
+    T* data_img,
+    CPUMathUtil* context,
+    concurrency::ThreadPool*);
+
 template <typename T, class Provider, int order>
 void Col2im(
     const T* data_col,
