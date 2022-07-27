@@ -309,25 +309,38 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
     int64_t stride_h,
     int64_t stride_w,
     T* data_col,
+    ThreadPool* tp,
     T padding_value) {
-  std::cout << " Im2Col<NCHW> channels: " << channels << std::endl;
 
   const int64_t output_h = (height + pad_b + pad_t - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
   const int64_t output_w = (width + pad_l + pad_r - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
+  constexpr int64_t cost_per_batch = 4864;
+  const auto cost_per_channel = kernel_h * kernel_w * output_h * output_w;
+  const auto total_cost = cost_per_channel * channels;
+  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+
   // From Intel, https://github.com/BVLC/caffe/pull/3536
-  int64_t channel_size = height * width;
-  for (int64_t channel = channels; channel--; data_im += channel_size) {
-    for (int64_t kernel_row = 0; kernel_row < kernel_h; kernel_row++) {
-      for (int64_t kernel_col = 0; kernel_col < kernel_w; kernel_col++) {
-        int64_t input_row = -pad_t + kernel_row * dilation_h;
+  const int64_t input_channel_size = height * width;
+
+  // for (int64_t channel = channels; channel--; data_im += input_channel_size) {
+  auto channel_proc = [=](ptrdiff_t channel) {
+    const auto* const data_input = data_im + channel * input_channel_size;
+    auto* data_output = data_col + channel * cost_per_channel;
+    for (int64_t kernel_row = 0, kernel_row_dilation_h = 0;
+         kernel_row < kernel_h;
+         kernel_row++, kernel_row_dilation_h += dilation_h) {
+      for (int64_t kernel_col = 0, kernel_col_dilation_w = 0;
+           kernel_col < kernel_w;
+           kernel_col++, kernel_col_dilation_w += dilation_w) {
+        int64_t input_row = -pad_t + kernel_row_dilation_h;
         for (int64_t output_rows = output_h; output_rows; output_rows--) {
           if (!is_a_ge_zero_and_a_lt_b(input_row, height)) {
-            std::fill_n(data_col, output_w, padding_value);
-            data_col += output_w;
+            std::fill_n(data_output, output_w, padding_value);
+            data_output += output_w;
           } else {
-            int64_t input_col = -pad_l + kernel_col * dilation_w;
-            const T* rdptr = data_im + input_row * width + input_col;
+            int64_t input_col = -pad_l + kernel_col_dilation_w;
+            const T* rdptr = data_input + input_row * width + input_col;
             for (int64_t i = 0; i < output_w;) {
               int64_t output_handled = 1;
               if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
@@ -335,20 +348,20 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
                   // Compute the minimum of the number of input elements remaining
                   // and the number of output elements to produce.
                   output_handled = std::min(width - input_col, output_w - i);
-                  data_col = std::copy_n(&rdptr[i], static_cast<size_t>(output_handled), data_col);
+                  data_output = std::copy_n(&rdptr[i], static_cast<size_t>(output_handled), data_output);
                 } else if (stride_w == 2) {
                   // Same as above except using the number of strided input elements.
                   output_handled = std::min((width - input_col + 1) / 2, output_w - i);
                   const T* local_rdptr = &rdptr[i * 2];
                   for (int64_t x = output_handled; x > 0; x--) {
-                    *(data_col++) = *local_rdptr;
+                    *(data_output++) = *local_rdptr;
                     local_rdptr += 2;
                   }
                 } else {
-                  *(data_col++) = rdptr[i * stride_w];
+                  *(data_output++) = rdptr[i * stride_w];
                 }
               } else {
-                *(data_col++) = padding_value;
+                *(data_output++) = padding_value;
               }
               input_col += output_handled * stride_w;
               i += output_handled;
@@ -358,25 +371,8 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
         }
       }
     }
-  }
-}
-
-template <typename T>
-void Im2col<T, StorageOrder::NCHW>::operator()(
-    const T* data_im,
-    const int64_t* im_shape,
-    const int64_t* output_shape,
-    int64_t channels_col,
-    const int64_t* kernel_shape,
-    const int64_t* stride,
-    const int64_t* dilation,
-    const int64_t* pad,
-    ptrdiff_t rank,
-    T* data_col,
-    bool accumulate_output,
-    T padding_value) {
-  (*this)(data_im, im_shape, output_shape, channels_col, kernel_shape, stride, dilation, pad, rank, data_col,
-          nullptr, accumulate_output, padding_value);
+  };
+  ThreadPool::TryBatchParallelFor(tp, channels, channel_proc, batches);
 }
 
 template <typename T>
@@ -427,6 +423,7 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
         index_im *= im_shape[d_i];
         index_im += d_im;
       }
+
       if (!accumulate_output) {
         if (is_padding) {
           data_col[index_col] = padding_value;
@@ -438,6 +435,14 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
       }
     } while (NextPosition(rank, output_shape, d_iter.data()));
   };
+
+  if (accumulate_output) {
+    // For accumulation, threads would be summing data up
+    // on the same index_im, as those are repeated although
+    // but index_col is never repeated
+    // so we can not partition on accumulation.
+    tp = nullptr;
+  }
 
   ThreadPool::TryBatchParallelFor(tp, channels_col, channel_proc, batches);
 }
@@ -698,11 +703,11 @@ void Col2imPar<float, StorageOrder::NCHW>(const float* data_col, int64_t channel
   const int64_t output_w =
       (width + pad_l + pad_r - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
   const int64_t output_hw = output_h * output_w;
-  const int64_t hw = height * width;
-  const int64_t hwc = hw * channels;
+  const int64_t hw = height * width;  // Output per channel
+  const int64_t hwc = hw * channels;  // Total output
 
   constexpr int64_t cost_per_batch = 4864;                        // Experimentally found number
-  const auto data_per_channel = kernel_h * kernel_w * output_hw;  // From the loops below
+  const auto data_per_channel = kernel_h * kernel_w * output_hw;  // Input. From the loops below
   const auto total_cost = data_per_channel * channels;
   const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
 

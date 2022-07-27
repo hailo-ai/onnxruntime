@@ -109,7 +109,8 @@ Status Conv<T>::Compute(OpKernelContext* context) const {
               pads[3],
               strides[0],
               strides[1],
-              col_buffer_data);
+              col_buffer_data,
+              thread_pool);
         } else {
           math::Im2col<T, StorageOrder::NCHW>()(
               Xdata + group_id * X_offset,

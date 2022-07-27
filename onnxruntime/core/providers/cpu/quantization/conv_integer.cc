@@ -133,6 +133,7 @@ Status ConvInteger::Compute(OpKernelContext* context) const {
               strides[0],
               strides[1],
               col_buffer_data,
+              thread_pool,
               input_offset);
         } else {
           math::Im2col<uint8_t, StorageOrder::NCHW>()(

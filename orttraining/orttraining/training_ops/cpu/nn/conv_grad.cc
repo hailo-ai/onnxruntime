@@ -123,7 +123,8 @@ Status ConvGrad<T>::Compute(OpKernelContext* context) const {
                 pads[1],
                 1,
                 strides[0],
-                col_buffer_data);
+                col_buffer_data,
+                tp);
           } else if (kernel_rank == 2) {
             math::Im2col<T, StorageOrder::NCHW>()(
                 Xdata + group_id * X_offset,
@@ -140,7 +141,8 @@ Status ConvGrad<T>::Compute(OpKernelContext* context) const {
                 pads[3],
                 strides[0],
                 strides[1],
-                col_buffer_data);
+                col_buffer_data,
+                tp);
           } else {
             math::Im2col<T, StorageOrder::NCHW>()(
                 Xdata + group_id * X_offset,
@@ -152,7 +154,8 @@ Status ConvGrad<T>::Compute(OpKernelContext* context) const {
                 dilations.data(),
                 pads.data(),
                 static_cast<int>(kernel_shape.size()),
-                col_buffer_data);
+                col_buffer_data,
+                tp);
           }
         }
         // Gradient with respect to W, filter.
@@ -224,6 +227,7 @@ Status ConvGrad<T>::Compute(OpKernelContext* context) const {
               strides[0],
               strides[1],
               dXdata,
+              &CPUMathUtil::Instance(),
               tp);
         } else {
           math::Col2imNdPar<T, StorageOrder::NCHW>(
