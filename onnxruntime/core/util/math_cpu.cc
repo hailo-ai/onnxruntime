@@ -609,17 +609,21 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
     ptrdiff_t rank,
     int64_t output_start,
     int64_t output_count,
+    ThreadPool* tp,
     T const** data_indirection,
     const T* padding_ptr) {
+
+  constexpr int64_t cost_per_batch = 8192;
+  const auto kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
+
   if (rank == 1) {
-    int64_t stride_w = stride[0];
-    int64_t kernel_w = kernel_shape[0];
-    int64_t dilation_w = dilation[0];
-    int64_t pad_l = pad[0];
-    int64_t input_w = input_shape[0];
-
+    const int64_t stride_w = stride[0];
+    const int64_t kernel_w = kernel_shape[0];
+    const int64_t dilation_w = dilation[0];
+    const int64_t pad_l = pad[0];
+    const int64_t input_w = input_shape[0];
+    
     int64_t ow = output_start * stride_w;
-
     while (output_count--) {
       int64_t iw = ow - pad_l;
       for (int64_t kw = 0; kw < kernel_w; kw++) {
@@ -685,18 +689,22 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
     }
 
   } else {
-    // iterate dimensions on output image shape (without Batch and Channel)
-    InlinedVector<int64_t> d_output(rank, 0);
-    // inner iterate dimensions on kernel shape (without output channel and input channel)
-    InlinedVector<int64_t> d_kernel(rank, 0);
+    const auto cost_per_output = kernel_size * rank;
+    const auto total_cost = output_count * cost_per_output;
+    const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
 
-    // Skip ahead to the starting output index.
-    for (ptrdiff_t d_i = rank - 1; d_i >= 0; --d_i) {
-      d_output[d_i] = output_start % output_shape[d_i];
-      output_start /= output_shape[d_i];
-    }
+    const auto data_per_output = kernel_size;
 
-    while (output_count--) {
+    auto im2col_proc = [=](ptrdiff_t output) {
+      auto** data_output = data_indirection + output * data_per_output;
+      // iterate dimensions on output image shape (without Batch and Channel)
+      InlinedVector<int64_t> d_output(rank, 0);
+      // inner iterate dimensions on kernel shape (without output channel and input channel)
+      InlinedVector<int64_t> d_kernel(rank, 0);
+
+      // Skip ahead to the starting output index.
+      NumToDims(gsl::narrow<int64_t>(output_start + output), gsl::make_span(output_shape, rank), gsl::make_span(d_output));
+
       // Loop over spatial axes in reverse order to choose an index on kernel dimensions
       do {
         // Loop over spatial axes in forward order to compute the indices in the image
@@ -710,14 +718,12 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
           index_im += d_input;
         }
         const T* data_ptr = data_im + index_im * input_channels;
-        *data_indirection++ = is_padding ? padding_ptr : data_ptr;
+        *data_output++ = is_padding ? padding_ptr : data_ptr;
       } while (NextPosition(rank, kernel_shape, d_kernel.data()));
-      // Loop over spatial axes along the output image shape
-      NextPosition(rank, output_shape, d_output.data());
-    }
+    };
+    ThreadPool::TryBatchParallelFor(tp, output_count, im2col_proc, batches);
   }
 }
-
 template struct Im2col<int8_t, StorageOrder::NHWC>;
 template struct Im2col<uint8_t, StorageOrder::NHWC>;
 

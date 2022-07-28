@@ -322,6 +322,35 @@ struct Im2col<T, StorageOrder::NHWC> {
       T* data_col,
       T padding_value = 0);
   void operator()(
+    const T*       data_im,
+    int64_t        input_channels,
+    const int64_t* input_shape,
+    const int64_t* output_shape,
+    const int64_t* kernel_shape,
+    const int64_t* stride,
+    const int64_t* dilation,
+    const int64_t* pad,
+    ptrdiff_t      rank,
+    int64_t        output_start,
+    int64_t        output_count,
+    T const**      data_indirection,
+    const T*       padding_ptr) {
+    (*this)(data_im,
+            input_channels,
+            input_shape,
+            output_shape,
+            kernel_shape,
+            stride,
+            dilation,
+            pad,
+            rank,
+            output_start,
+            output_count,
+            nullptr,
+            data_indirection,
+            padding_ptr);
+  }
+  void operator()(
       const T* data_im,
       int64_t input_channels,
       const int64_t* input_shape,
@@ -333,6 +362,7 @@ struct Im2col<T, StorageOrder::NHWC> {
       ptrdiff_t rank,
       int64_t output_start,
       int64_t output_count,
+      concurrency::ThreadPool* tp,
       T const** data_indirection,
       const T* padding_ptr);
 };
