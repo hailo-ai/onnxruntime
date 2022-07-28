@@ -18,6 +18,7 @@
 #include "core/util/math_cpuonly.h"
 #include "core/util/math.h"
 
+#include <windows.h>
 #include <algorithm>
 #include <iostream>
 #include <gsl/gsl>
@@ -279,7 +280,7 @@ SPECIALIZED_SET(uint16_t);
 static inline bool NextPosition(int64_t N, const int64_t* shape, int64_t* dims) {
   bool has_next_output = false;
   for (int64_t d_i = N - 1; d_i >= 0; --d_i) {
-    int64_t d_max = shape[d_i];
+    const int64_t d_max = shape[d_i];
     ORT_ENFORCE(dims[d_i] < d_max);
     if (dims[d_i] == d_max - 1) {
       dims[d_i] = 0;
@@ -290,6 +291,15 @@ static inline bool NextPosition(int64_t N, const int64_t* shape, int64_t* dims) 
     }
   }
   return has_next_output;
+}
+
+static inline void NumToDims(int64_t num, gsl::span<const int64_t> shape, gsl::span<int64_t> dims) {
+  ORT_ENFORCE(shape.size(), dims.size());
+  for (size_t d_i = dims.size() - 1; d_i >= 0 && num > 0; --d_i) {
+    auto d = num / shape[d_i];
+    dims[d_i] = num - d * shape[d_i];
+    num = d;
+  }
 }
 
 template <typename T>
@@ -311,11 +321,10 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
     T* data_col,
     ThreadPool* tp,
     T padding_value) {
-
   const int64_t output_h = (height + pad_b + pad_t - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
   const int64_t output_w = (width + pad_l + pad_r - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
-  constexpr int64_t cost_per_batch = 4864;
+  constexpr int64_t cost_per_batch = 8192;
   const auto cost_per_channel = kernel_h * kernel_w * output_h * output_w;
   const auto total_cost = cost_per_channel * channels;
   const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
@@ -393,7 +402,7 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
   const int64_t kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
   const auto output_size = std::accumulate(output_shape, output_shape + rank, 1LL, std::multiplies<int64_t>());
 
-  constexpr int64_t cost_per_batch = 4864;
+  constexpr int64_t cost_per_batch = 8129;
   const auto total_cost = output_size * (rank + 1) * channels_col;
   const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
 
@@ -468,16 +477,25 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
     int64_t output_w,
     int64_t output_start,
     int64_t output_count,
+    ThreadPool* tp,
     T* data_col,
     T padding_value) {
-  int64_t mh = output_start / output_w;
-  int64_t mw = output_start % output_w;
-  for (int64_t mz = output_start; mz < output_start + output_count; mz++) {
-    int64_t oh = mh * stride_h;
-    int64_t ow = mw * stride_w;
+  constexpr int64_t cost_per_batch = 8192;  // May need to be tuned
+  const auto cost_per_output = kernel_h * kernel_w * group_channels;
+  const auto total_cost = output_count * cost_per_output;
+  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+
+  auto im2col_proc = [=](ptrdiff_t output) {
+    const auto mz = output_start + output;
+    const auto mh = mz / output_w;
+    const auto mw = mz - (mh * output_w);
+    const int64_t oh = mh * stride_h;
+    const int64_t ow = mw * stride_w;
+
+    auto* output_col = data_col + output * cost_per_output;
 
     for (int64_t kh = 0; kh < kernel_h; kh++) {
-      int64_t ih = kh * dilation_h + oh - pad_t;
+      const int64_t ih = kh * dilation_h + oh - pad_t;
 
       if (is_a_ge_zero_and_a_lt_b(ih, input_h)) {
         int64_t iw = ow - pad_l;
@@ -487,12 +505,12 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
             if (is_a_ge_zero_and_a_lt_b(iw, input_w)) {
               // Increase the copy count size to reduce the number of copy calls.
               int64_t batch_w = std::min(kw, input_w - iw);
-              std::memcpy(data_col, data_im + (ih * input_w + iw) * group_channels, gsl::narrow<size_t>(sizeof(T) * batch_w * group_channels));
-              data_col += batch_w * group_channels;
+              std::memcpy(output_col, data_im + (ih * input_w + iw) * group_channels, gsl::narrow<size_t>(sizeof(T) * batch_w * group_channels));
+              output_col += batch_w * group_channels;
               iw += batch_w;
               kw -= batch_w;
             } else {
-              data_col = std::fill_n(data_col, group_channels, padding_value);
+              output_col = std::fill_n(output_col, group_channels, padding_value);
               iw++;
               kw--;
             }
@@ -502,24 +520,20 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
             if (is_a_ge_zero_and_a_lt_b(iw, input_w)) {
               // N.B. Using std::memcpy helped here over std::copy_n when doing a
               // transform for an image with a small number of group channels.
-              std::memcpy(data_col, data_im + (ih * input_w + iw) * input_channels, gsl::narrow<size_t>(sizeof(T) * group_channels));
-              data_col += group_channels;
+              std::memcpy(output_col, data_im + (ih * input_w + iw) * input_channels, gsl::narrow<size_t>(sizeof(T) * group_channels));
+              output_col += group_channels;
             } else {
-              data_col = std::fill_n(data_col, group_channels, padding_value);
+              output_col = std::fill_n(output_col, group_channels, padding_value);
             }
             iw += dilation_w;
           }
         }
       } else {
-        data_col = std::fill_n(data_col, kernel_w * group_channels, padding_value);
+        output_col = std::fill_n(output_col, kernel_w * group_channels, padding_value);
       }
     }
-
-    if (++mw == output_w) {
-      ++mh;
-      mw = 0;
-    }
-  }
+  };
+  ThreadPool::TryBatchParallelFor(tp, output_count, im2col_proc, batches);
 }
 
 template <typename T>
@@ -534,15 +548,29 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
     const int64_t* dilation,
     const int64_t* pad,
     ptrdiff_t rank,
+    ThreadPool* tp,
     T* data_col,
     T padding_value) {
-  // iterate dimensions on output image shape (without Batch and Channel)
-  InlinedVector<int64_t> d_output(rank, 0);
-  // inner iterate dimensions on kernel shape (without output channel and input channel)
-  InlinedVector<int64_t> d_kernel(rank, 0);
+  const auto kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
+  const auto output_count = std::accumulate(output_shape, output_shape + rank, 1LL, std::multiplies<int64_t>());
 
-  // Loop over spatial axes along the output image shape
-  do {
+  constexpr int64_t cost_per_batch = 8192;
+  const auto cost_per_output = kernel_size * (group_channels + rank);
+  const auto total_cost = output_count * cost_per_output;
+  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+
+  const auto data_per_output = kernel_size * group_channels;
+
+  auto im2col_proc = [=](ptrdiff_t output) {
+    auto* output_data = data_col + output * data_per_output;
+    // iterate dimensions on output image shape (without Batch and Channel)
+    InlinedVector<int64_t> d_output(rank, 0);
+    // inner iterate dimensions on kernel shape (without output channel and input channel)
+    InlinedVector<int64_t> d_kernel(rank, 0);
+
+    // Break down output number to dims
+    NumToDims(gsl::narrow<int64_t>(output), gsl::make_span(output_shape, rank), gsl::make_span(d_output));
+
     // Loop over spatial axes in reverse order to choose an index on kernel dimensions
     do {
       // Loop over spatial axes in forward order to compute the indices in the image
@@ -558,12 +586,14 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
       index_im *= input_channels;
 
       if (is_padding) {
-        data_col = std::fill_n(data_col, group_channels, padding_value);
+        output_data = std::fill_n(output_data, group_channels, padding_value);
       } else {
-        data_col = std::copy_n(data_im + index_im, group_channels, data_col);
+        output_data = std::copy_n(data_im + index_im, group_channels, output_data);
       }
     } while (NextPosition(rank, kernel_shape, d_kernel.data()));
-  } while (NextPosition(rank, output_shape, d_output.data()));
+  };
+
+  ThreadPool::TryBatchParallelFor(tp, output_count, im2col_proc, batches);
 }
 
 template <typename T>
@@ -706,7 +736,7 @@ void Col2imPar<float, StorageOrder::NCHW>(const float* data_col, int64_t channel
   const int64_t hw = height * width;  // Output per channel
   const int64_t hwc = hw * channels;  // Total output
 
-  constexpr int64_t cost_per_batch = 4864;                        // Experimentally found number
+  constexpr int64_t cost_per_batch = 8129;
   const auto data_per_channel = kernel_h * kernel_w * output_hw;  // Input. From the loops below
   const auto total_cost = data_per_channel * channels;
   const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
@@ -752,7 +782,6 @@ void Col2imPar<float, StorageOrder::NCHW>(const float* data_col, int64_t channel
 
   // Fallback
   const int64_t h_offset_step = dilation_h * width;
-  // for (auto* dst = data_im; dst < dst_end; dst += hw)
   auto fallback_channel_proc = [=](ptrdiff_t channel) {
     // compute src start for this channel
     const auto* src = data_col + channel * data_per_channel;
