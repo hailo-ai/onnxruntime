@@ -220,45 +220,6 @@ struct Im2col<T, StorageOrder::NCHW> {
 template <typename T>
 struct Im2col<T, StorageOrder::NHWC> {
   void operator()(
-    const T* data_im,
-    int64_t group_channels,
-    int64_t input_channels,
-    int64_t input_h,
-    int64_t input_w,
-    int64_t kernel_h,
-    int64_t kernel_w,
-    int64_t dilation_h,
-    int64_t dilation_w,
-    int64_t pad_t,
-    int64_t pad_l,
-    int64_t stride_h,
-    int64_t stride_w,
-    int64_t output_w,
-    int64_t output_start,
-    int64_t output_count,
-    T* data_col,
-    T padding_value = 0) {
-    (*this)(data_im,
-            group_channels,
-            input_channels,
-            input_h,
-            input_w,
-            kernel_h,
-            kernel_w,
-            dilation_h,
-            dilation_w,
-            pad_t,
-            pad_l,
-            stride_h,
-            stride_w,
-            output_w,
-            output_start,
-            output_count,
-            nullptr,
-            data_col,
-            padding_value);
-  }
-  void operator()(
       const T* data_im,
       int64_t group_channels,
       int64_t input_channels,
@@ -280,34 +241,6 @@ struct Im2col<T, StorageOrder::NHWC> {
       T padding_value = 0);
 
   void operator()(
-    const T* data_im,
-    int64_t group_channels,
-    int64_t input_channels,
-    const int64_t* input_shape,
-    const int64_t* output_shape,
-    const int64_t* kernel_shape,
-    const int64_t* stride,
-    const int64_t* dilation,
-    const int64_t* pad,
-    ptrdiff_t rank,
-    T* data_col,
-    T padding_value = 0) {
-    (*this)(data_im,
-            group_channels,
-            input_channels,
-            input_shape,
-            output_shape,
-            kernel_shape,
-            stride,
-            dilation,
-            pad,
-            rank,
-            nullptr,
-            data_col,
-            padding_value);
-  }
-
-  void operator()(
       const T* data_im,
       int64_t group_channels,
       int64_t input_channels,
@@ -321,35 +254,6 @@ struct Im2col<T, StorageOrder::NHWC> {
       concurrency::ThreadPool* tp,
       T* data_col,
       T padding_value = 0);
-  void operator()(
-    const T*       data_im,
-    int64_t        input_channels,
-    const int64_t* input_shape,
-    const int64_t* output_shape,
-    const int64_t* kernel_shape,
-    const int64_t* stride,
-    const int64_t* dilation,
-    const int64_t* pad,
-    ptrdiff_t      rank,
-    int64_t        output_start,
-    int64_t        output_count,
-    T const**      data_indirection,
-    const T*       padding_ptr) {
-    (*this)(data_im,
-            input_channels,
-            input_shape,
-            output_shape,
-            kernel_shape,
-            stride,
-            dilation,
-            pad,
-            rank,
-            output_start,
-            output_count,
-            nullptr,
-            data_indirection,
-            padding_ptr);
-  }
   void operator()(
       const T* data_im,
       int64_t input_channels,
@@ -366,21 +270,6 @@ struct Im2col<T, StorageOrder::NHWC> {
       T const** data_indirection,
       const T* padding_ptr);
 };
-
-template <typename T, class Provider, int order>
-void Col2imNd(
-    const T* data_col,
-    const int64_t* img_shape,
-    const int64_t* output_shape,
-    int64_t channels_col,
-    int64_t img_size,
-    const int64_t* kernel_shape,
-    const int64_t* stride,
-    const int64_t* dilation,
-    const int64_t* pad,
-    ptrdiff_t N,
-    T* data_img,
-    Provider* provider);
 
 template <typename T, int order>
 void Col2imNdPar(
