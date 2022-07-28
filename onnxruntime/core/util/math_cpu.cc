@@ -296,9 +296,9 @@ static inline bool NextPosition(int64_t N, const int64_t* shape, int64_t* dims) 
 static inline void NumToDims(int64_t num, gsl::span<const int64_t> shape, gsl::span<int64_t> dims) {
   ORT_ENFORCE(shape.size(), dims.size());
   for (size_t d_i = dims.size() - 1; d_i >= 0 && num > 0; --d_i) {
-    auto d = num / shape[d_i];
-    dims[d_i] = num - d * shape[d_i];
-    num = d;
+    const auto carry = num / shape[d_i];
+    dims[d_i] = num - carry * shape[d_i];
+    num = carry;
   }
 }
 
@@ -324,15 +324,15 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
   const int64_t output_h = (height + pad_b + pad_t - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
   const int64_t output_w = (width + pad_l + pad_r - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
+  const auto dop = ThreadPool::DegreeOfParallelism(tp);
   constexpr int64_t cost_per_batch = 8192;
   const auto cost_per_channel = kernel_h * kernel_w * output_h * output_w;
   const auto total_cost = cost_per_channel * channels;
-  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+  const auto batches = std::min<int64_t>((total_cost + cost_per_batch - 1) / cost_per_batch, dop);
 
   // From Intel, https://github.com/BVLC/caffe/pull/3536
   const int64_t input_channel_size = height * width;
 
-  // for (int64_t channel = channels; channel--; data_im += input_channel_size) {
   auto channel_proc = [=](ptrdiff_t channel) {
     const auto* const data_input = data_im + channel * input_channel_size;
     auto* data_output = data_col + channel * cost_per_channel;
@@ -402,14 +402,16 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
   const int64_t kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
   const auto output_size = std::accumulate(output_shape, output_shape + rank, 1LL, std::multiplies<int64_t>());
 
+  const auto dop = ThreadPool::DegreeOfParallelism(tp);
   constexpr int64_t cost_per_batch = 8129;
   const auto total_cost = output_size * (rank + 1) * channels_col;
-  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+  const auto batches = std::min<int64_t>((total_cost + cost_per_batch - 1) / cost_per_batch, dop);
 
   auto channel_proc = [=](ptrdiff_t c_col) {
     // Loop over spatial axes in reverse order to compute a per-axis offset.
     InlinedVector<int64_t> d_offset(rank, 0);
     InlinedVector<int64_t> d_iter(rank, 0);
+
     int64_t offset = c_col;
     for (ptrdiff_t d_i = rank - 1; d_i >= 0; --d_i) {
       if (d_i < rank - 1) {
@@ -417,6 +419,7 @@ void Im2col<T, StorageOrder::NCHW>::operator()(
       }
       d_offset[d_i] = offset % kernel_shape[d_i];
     }
+
     do {
       // Loop over spatial axes in forward order to compute the indices in the
       // image and column, and whether the index lies in the padding.
@@ -480,10 +483,12 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
     ThreadPool* tp,
     T* data_col,
     T padding_value) {
-  constexpr int64_t cost_per_batch = 8192;  // May need to be tuned
+
+  const auto dop = ThreadPool::DegreeOfParallelism(tp);
+  constexpr int64_t cost_per_batch = 8192;  // Tunable
   const auto cost_per_output = kernel_h * kernel_w * group_channels;
   const auto total_cost = output_count * cost_per_output;
-  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+  const auto batches = std::min<int64_t>((total_cost + cost_per_batch - 1) / cost_per_batch, dop);
 
   auto im2col_proc = [=](ptrdiff_t output) {
     const auto mz = output_start + output;
@@ -551,13 +556,16 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
     ThreadPool* tp,
     T* data_col,
     T padding_value) {
+
+  const auto dop = ThreadPool::DegreeOfParallelism(tp);
+
   const auto kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
   const auto output_count = std::accumulate(output_shape, output_shape + rank, 1LL, std::multiplies<int64_t>());
 
   constexpr int64_t cost_per_batch = 8192;
   const auto cost_per_output = kernel_size * (group_channels + rank);
   const auto total_cost = output_count * cost_per_output;
-  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+  const auto batches = std::min<int64_t>((total_cost + cost_per_batch - 1) / cost_per_batch, dop);
 
   const auto data_per_output = kernel_size * group_channels;
 
@@ -613,8 +621,8 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
     T const** data_indirection,
     const T* padding_ptr) {
 
+  const auto dop = ThreadPool::DegreeOfParallelism(tp);
   constexpr int64_t cost_per_batch = 8192;
-  const auto kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
 
   if (rank == 1) {
     const int64_t stride_w = stride[0];
@@ -622,7 +630,7 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
     const int64_t dilation_w = dilation[0];
     const int64_t pad_l = pad[0];
     const int64_t input_w = input_shape[0];
-    
+
     int64_t ow = output_start * stride_w;
     while (output_count--) {
       int64_t iw = ow - pad_l;
@@ -634,25 +642,31 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
       data_indirection += kernel_w;
       ow += stride_w;
     }
-
   } else if (rank == 2) {
-    int64_t stride_h = stride[0];
-    int64_t stride_w = stride[1];
-    int64_t kernel_h = kernel_shape[0];
-    int64_t kernel_w = kernel_shape[1];
-    int64_t dilation_h = dilation[0];
-    int64_t dilation_w = dilation[1];
-    int64_t pad_t = pad[0];
-    int64_t pad_l = pad[1];
-    int64_t input_h = input_shape[0];
-    int64_t input_w = input_shape[1];
-    int64_t output_w = output_shape[1];
+    const int64_t stride_h = stride[0];
+    const int64_t stride_w = stride[1];
+    const int64_t kernel_h = kernel_shape[0];
+    const int64_t kernel_w = kernel_shape[1];
+    const int64_t dilation_h = dilation[0];
+    const int64_t dilation_w = dilation[1];
+    const int64_t pad_t = pad[0];
+    const int64_t pad_l = pad[1];
+    const int64_t input_h = input_shape[0];
+    const int64_t input_w = input_shape[1];
+    const int64_t output_w = output_shape[1];
 
-    int64_t oh = (output_start / output_w) * stride_h;
-    int64_t ow = (output_start % output_w) * stride_w;
-    int64_t ow_end = output_w * stride_w;
+    const auto cost_per_output = kernel_h * kernel_w;
+    const auto total_cost = output_count * cost_per_output;
+    const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
 
-    while (output_count--) {
+    auto im2col_proc = [=](ptrdiff_t output) {
+
+      const auto output_off = output_start + output;
+      const auto outputs = output_off / output_w;
+      const int64_t oh = outputs * stride_h;
+      const int64_t ow = (output_off - outputs * output_w) * stride_w;
+
+      auto** output_indir = data_indirection + output * cost_per_output;
       for (int64_t kh = 0; kh < kernel_h; kh++) {
         int64_t ih = kh * dilation_h + oh - pad_t;
         if (is_a_ge_zero_and_a_lt_b(ih, input_h)) {
@@ -660,38 +674,35 @@ void Im2col<T, StorageOrder::NHWC>::operator()(
           int64_t iw = ow - pad_l;
           if (kernel_w == 3) {
             const T* data_ptr0 = data_im + (ihw + iw) * input_channels;
-            data_indirection[0] = is_a_ge_zero_and_a_lt_b(iw, input_w) ? data_ptr0 : padding_ptr;
+            output_indir[0] = is_a_ge_zero_and_a_lt_b(iw, input_w) ? data_ptr0 : padding_ptr;
             iw += dilation_w;
             const T* data_ptr1 = data_im + (ihw + iw) * input_channels;
-            data_indirection[1] = is_a_ge_zero_and_a_lt_b(iw, input_w) ? data_ptr1 : padding_ptr;
+            output_indir[1] = is_a_ge_zero_and_a_lt_b(iw, input_w) ? data_ptr1 : padding_ptr;
             iw += dilation_w;
             const T* data_ptr2 = data_im + (ihw + iw) * input_channels;
-            data_indirection[2] = is_a_ge_zero_and_a_lt_b(iw, input_w) ? data_ptr2 : padding_ptr;
+            output_indir[2] = is_a_ge_zero_and_a_lt_b(iw, input_w) ? data_ptr2 : padding_ptr;
           } else {
             for (int64_t kw = 0; kw < kernel_w; kw++) {
               const T* data_ptr = data_im + (ihw + iw) * input_channels;
-              data_indirection[kw] = is_a_ge_zero_and_a_lt_b(iw, input_w) ? data_ptr : padding_ptr;
+              output_indir[kw] = is_a_ge_zero_and_a_lt_b(iw, input_w) ? data_ptr : padding_ptr;
               iw += dilation_w;
             }
           }
         } else {
           for (int64_t kw = 0; kw < kernel_w; kw++) {
-            data_indirection[kw] = padding_ptr;
+            output_indir[kw] = padding_ptr;
           }
         }
-        data_indirection += kernel_w;
+        output_indir += kernel_w;
       }
-      ow += stride_w;
-      if (ow == ow_end) {
-        oh += stride_h;
-        ow = 0;
-      }
-    }
-
+    };
+    ThreadPool::TryBatchParallelFor(tp, output_count, im2col_proc, batches);
   } else {
+    const auto kernel_size = std::accumulate(kernel_shape, kernel_shape + rank, 1LL, std::multiplies<int64_t>());
+
     const auto cost_per_output = kernel_size * rank;
     const auto total_cost = output_count * cost_per_output;
-    const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+    const auto batches = std::min<int64_t>((total_cost + cost_per_batch - 1) / cost_per_batch, dop);
 
     const auto data_per_output = kernel_size;
 
@@ -742,10 +753,11 @@ void Col2imPar<float, StorageOrder::NCHW>(const float* data_col, int64_t channel
   const int64_t hw = height * width;  // Output per channel
   const int64_t hwc = hw * channels;  // Total output
 
+  const auto dop = ThreadPool::DegreeOfParallelism(tp);
   constexpr int64_t cost_per_batch = 8129;
   const auto data_per_channel = kernel_h * kernel_w * output_hw;  // Input. From the loops below
   const auto total_cost = data_per_channel * channels;
-  const auto batches = (total_cost + cost_per_batch - 1) / cost_per_batch;
+  const auto batches = std::min<int64_t>((total_cost + cost_per_batch - 1) / cost_per_batch, dop);
 
   Set<float, CPUMathUtil>(gsl::narrow<ptrdiff_t>(hwc), 0, data_im, context);
 
