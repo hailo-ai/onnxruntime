@@ -3373,6 +3373,7 @@ ORT_API_STATUS(OrtSessionOptionsAppendExecutionProvider_CUDA, _In_ OrtSessionOpt
 */
 ORT_API_STATUS(OrtSessionOptionsAppendExecutionProvider_MIGraphX, _In_ OrtSessionOptions* options, int device_id);
 
+ORT_API_STATUS(OrtSessionOptionsAppendExecutionProvider_Hailo, _In_ OrtSessionOptions* options, int use_arena);
 
 #ifdef __cplusplus
 }
