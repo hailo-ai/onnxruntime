@@ -21,7 +21,7 @@ namespace onnxruntime {
 namespace test {
 
 #define ONNX_SHORTCUT_FILE_PATH ("testdata/hailo/shortcut_example.onnx")
-#define ONNX_MULTIPULE_OUTPUTS_FILE_PATH ("testdata/hailo/multiple_outputs.onnx")
+#define ONNX_MULTIPLE_OUTPUTS_FILE_PATH ("testdata/hailo/multiple_outputs.onnx")
 
 #define DEFAULT_DEVICE_ID (0)
 #define DEFAULT_CONST_VALUE (0xAB)
@@ -43,8 +43,8 @@ public:
     TestDataShortcut(const float32_t const_val = DEFAULT_CONST_VALUE) :
         m_model_path(ONNX_SHORTCUT_FILE_PATH),
         m_input_shape({1, 3, 24, 16}),
-        m_input_name("x.1"),
-        m_output_names({"28"})
+        m_input_name("input0"),
+        m_output_names({"output0"})
     {
         size_t input_size = m_input_shape[0] * m_input_shape[1] * m_input_shape[2] * m_input_shape[3];
         m_input_dataset = create_const_dataset<float32_t>(input_size, const_val);
@@ -66,28 +66,29 @@ class TestDataMultipleOutputs
 {
 public:
     TestDataMultipleOutputs(uint32_t frames_count = 1) :
-        m_model_path(ONNX_MULTIPULE_OUTPUTS_FILE_PATH),
+        m_model_path(ONNX_MULTIPLE_OUTPUTS_FILE_PATH),
         m_input_shape({frames_count, 3, 4, 4}),
         m_input_name("input0"),
         m_output_names({"output0", "output1"})
     {
         size_t input_size = m_input_shape[0] * m_input_shape[1] * m_input_shape[2] * m_input_shape[3];
-        m_input_dataset = create_const_dataset<uint8_t>(input_size);
+        m_input_dataset = create_const_dataset<uint8_t>(input_size, DEFAULT_CONST_VALUE);
 
         const size_t outputs_count = 2;
         m_expected_results.reserve(outputs_count);
 
-        std::vector<int64_t> output0_shape = {frames_count, 8, 4, 4};
+        std::vector<int64_t> output0_shape = m_input_shape;
+        output0_shape[1] = output0_shape[1] * 2;
         size_t output0_size = output0_shape[0] * output0_shape[1] * output0_shape[2] * output0_shape[3];
-        const uint8_t output0_expected_byte = 0x8b;
+        const uint8_t output0_expected_byte = DEFAULT_CONST_VALUE;
         m_expected_results.emplace_back(std::move(output0_shape), create_const_dataset(output0_size, output0_expected_byte));
 
-        std::vector<int64_t> output1_shape = {frames_count, 3, 4, 4};
+        std::vector<int64_t> output1_shape = m_input_shape;
         size_t output1_size = output1_shape[0] * output1_shape[1] * output1_shape[2] * output1_shape[3];
-        const uint8_t output1_expected_byte = 0x2f;
+        const uint8_t output1_expected_byte = DEFAULT_CONST_VALUE;
         m_expected_results.emplace_back(std::move(output1_shape), create_const_dataset(output1_size, output1_expected_byte));
     }
-    
+
     std::string m_model_path;
     std::vector<int64_t> m_input_shape;
     std::string m_input_name;
@@ -179,26 +180,26 @@ TEST(HailoCustomOpTest, hailo_custom_op_sanity)
     Single input ("input0").
     Two outputs ("output0", "output1").
 */
-TEST(HailoCustomOpTest, multipule_outputs)
+TEST(HailoCustomOpTest, multiple_outputs)
 {
     auto multple_outputs_model_data = TestDataMultipleOutputs();
-    const std::string session_logid = "HailoCustomOpTest.multipule_outputs";
+    const std::string session_logid = "HailoCustomOpTest.multiple_outputs";
     run_hailo_test<uint8_t>(multple_outputs_model_data.m_model_path, session_logid, multple_outputs_model_data.m_input_shape,
         multple_outputs_model_data.m_input_dataset, multple_outputs_model_data.m_input_name,
         multple_outputs_model_data.m_output_names, multple_outputs_model_data.m_expected_results);
 }
 
-TEST(HailoCustomOpTest, multipule_outputs_dynamic_frames_count)
+TEST(HailoCustomOpTest, multiple_outputs_dynamic_frames_count)
 {
     const uint32_t frames_count = 5;
     auto multple_outputs_model_data = TestDataMultipleOutputs(frames_count);
-    const std::string session_logid = "HailoCustomOpTest.multipule_outputs_dynamic_frames_count";
+    const std::string session_logid = "HailoCustomOpTest.multiple_outputs_dynamic_frames_count";
     run_hailo_test<uint8_t>(multple_outputs_model_data.m_model_path, session_logid, multple_outputs_model_data.m_input_shape,
         multple_outputs_model_data.m_input_dataset, multple_outputs_model_data.m_input_name,
         multple_outputs_model_data.m_output_names, multple_outputs_model_data.m_expected_results);
 }
 
-TEST(HailoCustomOpTest, multipule_sessions)
+TEST(HailoCustomOpTest, multiple_sessions)
 {
     auto shortcut_model_data = TestDataShortcut();
     SessionOptions so1;
