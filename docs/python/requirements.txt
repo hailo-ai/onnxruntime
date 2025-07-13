@@ -5,7 +5,15 @@ skl2onnx
 sphinx
 sphinx-gallery
 sphinxcontrib.imagesvg
+sphinxcontrib.googleanalytics
 sphinx_rtd_theme
 pyquickhelper
 pandas
 pydot
+coloredlogs
+flatbuffers
+numpy
+packaging
+protobuf
+sympy
+onnx

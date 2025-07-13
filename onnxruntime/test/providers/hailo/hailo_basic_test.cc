@@ -295,7 +295,7 @@ TEST(HailoCustomOpTest, one_session_multiple_threads_stress)
 
 TEST(HailoCustomOpTest, hailo_provider_in_ort_api)
 {
-    const OrtApi* ort_api = OrtGetApiBase()->GetApi(11);
+    const OrtApi* ort_api = OrtGetApiBase()->GetApi(14);
     OrtSessionOptions* soptions;
     auto so_status = ort_api->CreateSessionOptions(&soptions);
     ASSERT_TRUE(so_status == nullptr); // nullptr for Status* indicates success (As written in onnxruntime_c_api.h)

@@ -99,10 +99,9 @@ InlinedVector<NodeIndex> HailoExecutionProvider::GetSupportedNodes(const GraphVi
 }
 
 std::vector<std::unique_ptr<ComputeCapability>> HailoExecutionProvider::GetCapability(
-    const GraphViewer& graph_viewer, const std::vector<const KernelRegistry*>& kernel_registries) const
+    const GraphViewer& graph_viewer,
+    const IKernelLookup& /*kernel_lookup*/) const
 {
-
-    ORT_UNUSED_PARAMETER(kernel_registries);
     std::vector<std::unique_ptr<ComputeCapability>> result;
 
     // We do not run Hailo EP on subgraph

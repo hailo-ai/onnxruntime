@@ -3,6 +3,18 @@
 
 set(MLAS_SRC_DIR ${ONNXRUNTIME_ROOT}/core/mlas/lib)
 
+
+set(MLAS_AMX_SUPPORTED FALSE)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 11)
+  set(MLAS_AMX_SUPPORTED TRUE)
+endif()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+  set(MLAS_AMX_SUPPORTED TRUE)
+endif()
+
+
 onnxruntime_add_static_library(onnxruntime_mlas
   ${MLAS_SRC_DIR}/platform.cpp
   ${MLAS_SRC_DIR}/threading.cpp
@@ -29,6 +41,12 @@ onnxruntime_add_static_library(onnxruntime_mlas
   ${MLAS_SRC_DIR}/qdwconv_kernelsize.cpp
 )
 
+if(MLAS_AMX_SUPPORTED)
+  target_compile_definitions(onnxruntime_mlas PRIVATE MLAS_AMX_SUPPORTED)
+else()
+  message(WARNING "AMX instructions NOT supported due to lack of compiler tool chain!")
+endif()
+
 set(ONNXRUNTIME_MLAS_LIBS onnxruntime_mlas)
 
 #TODO: set MASM flags properly
@@ -48,6 +66,7 @@ function(setup_mlas_source_for_windows)
 
       set(mlas_platform_preprocess_srcs
         ${MLAS_SRC_DIR}/arm64/ConvSymS8KernelDot.asm
+        ${MLAS_SRC_DIR}/arm64/ConvSymS8KernelDotLd64.asm
         ${MLAS_SRC_DIR}/arm64/ConvSymU8KernelDot.asm
         ${MLAS_SRC_DIR}/arm64/ConvSymS8KernelNeon.asm
         ${MLAS_SRC_DIR}/arm64/ConvSymU8KernelNeon.asm
@@ -122,10 +141,12 @@ function(setup_mlas_source_for_windows)
       ${MLAS_SRC_DIR}/dgemm.cpp
       ${mlas_platform_srcs_avx}
       ${mlas_platform_srcs_avx2}
+      ${MLAS_SRC_DIR}/qgemm_kernel_amx.cpp
       ${MLAS_SRC_DIR}/qgemm_kernel_avx2.cpp
       ${MLAS_SRC_DIR}/qgemm_kernel_sse.cpp
       ${MLAS_SRC_DIR}/qgemm_kernel_sse41.cpp
       ${MLAS_SRC_DIR}/intrinsics/avx512/quantize_avx512f.cpp
+      ${MLAS_SRC_DIR}/amd64/QgemmU8S8KernelAmx.asm
       ${MLAS_SRC_DIR}/amd64/QgemmU8S8KernelAvx2.asm
       ${MLAS_SRC_DIR}/amd64/QgemmU8U8KernelAvx2.asm
       ${MLAS_SRC_DIR}/amd64/QgemmU8X8KernelAvx2.asm
@@ -277,6 +298,7 @@ else()
         enable_language(ASM)
         set(mlas_platform_srcs
           ${MLAS_SRC_DIR}/aarch64/ConvSymS8KernelDot.S
+          ${MLAS_SRC_DIR}/aarch64/ConvSymS8KernelDotLd64.S
           ${MLAS_SRC_DIR}/aarch64/ConvSymU8KernelDot.S
           ${MLAS_SRC_DIR}/aarch64/ConvSymS8KernelNeon.S
           ${MLAS_SRC_DIR}/aarch64/ConvSymU8KernelNeon.S
@@ -482,6 +504,16 @@ else()
           ${mlas_platform_srcs_avx512core}
         )
 
+        if(MLAS_AMX_SUPPORTED)
+          set(mlas_platform_srcs
+            ${mlas_platform_srcs}
+            ${MLAS_SRC_DIR}/qgemm_kernel_amx.cpp
+            ${MLAS_SRC_DIR}/x86_64/QgemmU8S8KernelAmx.S
+          )
+          set_source_files_properties(${MLAS_SRC_DIR}/qgemm_kernel_amx.cpp PROPERTIES COMPILE_FLAGS "-mamx-tile -mamx-int8 -mavx2 -mavx512bw -mavx512dq -mavx512vl")
+          set_source_files_properties(${MLAS_SRC_DIR}/x86_64/QgemmU8S8KernelAmx.S PROPERTIES COMPILE_FLAGS "-mamx-tile -mamx-int8 -mavx2 -mavx512bw -mavx512dq -mavx512vl")
+        endif()
+
         if(ONNXRUNTIME_MLAS_MULTI_ARCH)
           onnxruntime_add_static_library(onnxruntime_mlas_x86_64 ${mlas_platform_srcs})
           set_target_properties(onnxruntime_mlas_x86_64 PROPERTIES OSX_ARCHITECTURES "x86_64")
@@ -500,6 +532,7 @@ endif()
 
 foreach(mlas_target ${ONNXRUNTIME_MLAS_LIBS})
     target_include_directories(${mlas_target} PRIVATE ${ONNXRUNTIME_ROOT}/core/mlas/inc ${MLAS_SRC_DIR})
+    onnxruntime_add_include_to_target(${mlas_target} ${GSL_TARGET})
 endforeach()
 set_target_properties(onnxruntime_mlas PROPERTIES FOLDER "ONNXRuntime")
 if (WIN32)
@@ -507,4 +540,12 @@ if (WIN32)
   if (onnxruntime_ENABLE_STATIC_ANALYSIS)
     target_compile_options(onnxruntime_mlas PRIVATE  "/analyze:stacksize 131072")
   endif()
+endif()
+
+if (NOT onnxruntime_BUILD_SHARED_LIB)
+    install(TARGETS onnxruntime_mlas
+            ARCHIVE   DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY   DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME   DESTINATION ${CMAKE_INSTALL_BINDIR}
+            FRAMEWORK DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

@@ -15,6 +15,10 @@ parameters:
   displayName: 'Package name'
   type: string
   default: 'NPM_packages'
+- name: BuildStaticLib
+  displayName: 'Build static library'
+  type: boolean
+  default: false
 
 stages:
 - stage: Extract_commit
@@ -46,7 +50,7 @@ stages:
     parameters:
       CommitOverride: true
       BuildConfig: 'Debug'
-      ExtraBuildArgs: '$(ExtraBuildArgs)'
+      ExtraBuildArgs: '--use_extensions --cmake_extra_defines onnxruntime_WEBASSEMBLY_DEFAULT_EXTENSION_FLAGS=ON $(ExtraBuildArgs)'
       PoolName: ${{ parameters.PoolName }}
 
 - stage: Build_web_Debug
@@ -67,8 +71,21 @@ stages:
     parameters:
       CommitOverride: true
       BuildConfig: 'Release'
-      ExtraBuildArgs: '--skip_tests --disable_wasm_exception_catching --disable_rtti $(ExtraBuildArgs)'
+      ExtraBuildArgs: '--skip_tests --enable_wasm_api_exception_catching --disable_rtti --use_extensions --cmake_extra_defines onnxruntime_WEBASSEMBLY_DEFAULT_EXTENSION_FLAGS=ON $(ExtraBuildArgs)'
       PoolName: ${{ parameters.PoolName }}
+
+- ${{ if eq(parameters.BuildStaticLib, 'true') }}:
+  - stage: Build_wasm_Release_static_library
+    dependsOn: Extract_commit
+    jobs:
+    - template: win-wasm-ci.yml
+      parameters:
+        CommitOverride: true
+        BuildConfig: 'Release'
+        ExtraBuildArgs: '$(ExtraBuildArgs)'
+        PoolName: ${{ parameters.PoolName }}
+        SkipPublish: true
+        TimeoutInMinutes: 180
 
 - stage: Build_web_Release
   dependsOn: Build_wasm_Release
@@ -81,7 +98,7 @@ stages:
       PoolName: ${{ parameters.PoolName }}
       PackageName: ${{ parameters.PackageName }}
 
-- ${{ if ne(parameters.IsReleasePipeline, 'true') }}:
+- ${{ if ne(parameters.IsReleasePipeline, true) }}:
   - stage: Test_web_BrowserStack
     dependsOn: Build_wasm_Release
     jobs:
@@ -89,7 +106,7 @@ stages:
       parameters:
         CommitOverride: true
 
-- ${{ if ne(parameters.IsReleasePipeline, 'true') }}:
+- ${{ if ne(parameters.IsReleasePipeline, true) }}:
   - stage: Test_web_MultiBrowsers
     dependsOn: Build_wasm_Release
     jobs:

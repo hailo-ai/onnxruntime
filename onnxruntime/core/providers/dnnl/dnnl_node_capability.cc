@@ -3,6 +3,7 @@
 
 #include "dnnl_node_capability.h"
 #include "dnnl.hpp"
+#include "subgraph/dnnl_util.h"
 
 #ifndef _USE_MATH_DEFINES
 #define _USE_MATH_DEFINES
@@ -33,6 +34,9 @@ bool DnnlDefaultNodeCapability::IsTypeSupported(const Node* node) const {
     auto node_datatype = node_inputs[0]->TypeAsProto()->tensor_type().elem_type();
     for (auto inputType : inputTypes_) {
       if (inputType == node_datatype) {
+        if (inputType == type_bfloat16) {
+          return ort_dnnl::dnnl_util::IsBF16Supported();
+        }
         return true;
       }
     }
@@ -66,7 +70,10 @@ bool DnnlDefaultMultiInputNodeCapability::IsTypeSupported(const Node* node) cons
     for (size_t i = 0; i < node_inputs.size(); ++i) {
       if (node_inputs[i]->TypeAsProto() != nullptr) {
         ORT_DataType node_datatype = static_cast<ORT_DataType>(node_inputs[i]->TypeAsProto()->tensor_type().elem_type());
-        input_supported[i] = (inputTypes_[i].find(node_datatype) != inputTypes_[i].end()); 
+        input_supported[i] = (inputTypes_[i].find(node_datatype) != inputTypes_[i].end());
+        if (node_datatype == type_bfloat16 && !ort_dnnl::dnnl_util::IsBF16Supported()) {
+          input_supported[i] = false;
+        }
       }
     }
     // Walk the input_supported make sure they are all supported
@@ -77,6 +84,63 @@ bool DnnlDefaultMultiInputNodeCapability::IsTypeSupported(const Node* node) cons
     }
   }
   return all_inputs_supported;
+}
+
+// DnnlDefaultOptionalMultiInputNodeCapability
+//-------------------------------------
+DnnlDefaultOptionalMultiInputNodeCapability::DnnlDefaultOptionalMultiInputNodeCapability(rule_map op_rules) {
+  for (const auto& rule : op_rules) {
+    // Get the rules into our map and count the number of mandatory inputs
+    op_rules_[rule.first] = rule.second;
+
+    // Check if the input is mandatory
+    if (rule.second.first) {
+      ++num_mandatory;
+    }
+  }
+}
+
+bool DnnlDefaultOptionalMultiInputNodeCapability::Supported(const Node* node, const GraphViewer& graph_viewer) const {
+  ORT_UNUSED_PARAMETER(graph_viewer);
+  if (!IsTypeSupported(node)) return false;
+  return true;
+}
+
+unsigned int DnnlDefaultOptionalMultiInputNodeCapability::GetNumMandatoryInputs() {
+  return num_mandatory;
+}
+
+bool DnnlDefaultOptionalMultiInputNodeCapability::IsTypeSupported(const Node* node) const {
+  // Get the node list its size
+  auto node_inputs = node->InputDefs();
+  auto num_nodes = node_inputs.size();
+
+  // We need to make sure that we have at least the mandatory inputs
+  if (num_mandatory <= num_nodes) {
+    // Iterate over each entry to check if the input is available, optional and supported
+    for (const auto& rule : op_rules_) {
+      if (rule.first < num_nodes) {
+        // Get the target node
+        auto node_input = node_inputs[rule.first];
+
+        // If we found the node we want and it is valid
+        if (node_input->TypeAsProto() != nullptr) {
+          // Get its datatype
+          ORT_DataType node_datatype = static_cast<ORT_DataType>(node_input->TypeAsProto()->tensor_type().elem_type());
+
+          // If the datatype is NOT on the supported list, we dont support the op
+          if (rule.second.second.find(node_datatype) == rule.second.second.end()) {
+            return false;
+          }
+        }
+      }
+    }
+    // If the node doesn't have the minimum mandatory inputs
+  } else {
+    return false;
+  }
+
+  return true;
 }
 
 // DnnlPoolNodeCapability class
@@ -237,13 +301,20 @@ bool DnnlSoftmaxNodeCapability::IsAttributeSupported(const Node* node) const {
   return true;
 }
 
-
 // DnnlMatMulNodeCapability class
 //-------------------------------------
 bool DnnlMatMulNodeCapability::Supported(const Node* node, const GraphViewer& graph_viewer) const {
   ORT_UNUSED_PARAMETER(graph_viewer);
   if (!IsTypeSupported(node)) return false;
   if (!IsDimensionSupported(node)) return false;
+  return true;
+}
+
+// DnnlLRNNodeCapability class
+//-------------------------------------
+bool DnnlLRNNodeCapability::Supported(const Node* node, const GraphViewer& graph_viewer) const {
+  ORT_UNUSED_PARAMETER(graph_viewer);
+  if (!IsTypeSupported(node)) return false;
   return true;
 }
 
@@ -432,12 +503,30 @@ bool DnnlSumNodeCapability::IsDimensionSupported(const Node* node) const {
 bool DnnlBinaryNodeCapability::Supported(const Node* node, const GraphViewer& graph_viewer) const {
   ORT_UNUSED_PARAMETER(graph_viewer);
   if (!IsTypeSupported(node)) return false;
-  //gpu broadcast for source 0 not supported
-  if (dnnl_engine_get_count(dnnl_engine_kind_t::dnnl_gpu)) {
-    return false;
+  if(!IsBF16Supported(node)) return false;
+  return true;
+}
+
+bool DnnlBinaryNodeCapability::IsBF16Supported(const Node* node) const {
+  // This is special caseing the Binary operators Less, LessOrEqual, Greator, GreatorOrEqual, and Equal
+  // The listed operators are known to not work on GPU and we should indicate lack of GPU support.
+  auto node_inputs = node->InputDefs();
+  if (!node_inputs.empty() && node_inputs[0]->TypeAsProto() != nullptr) {
+    auto node_datatype = node_inputs[0]->TypeAsProto()->tensor_type().elem_type();
+    if(type_bfloat16 == node_datatype) {
+      if (node->OpType() == "Less" ||
+          node->OpType() == "Greator" ||
+          std::string::npos != node->OpType().find("Equal")) {
+            if (ort_dnnl::dnnl_util::IsGPURuntimeAvalible()) {
+              return false;
+            }
+          }
+      return true;
+    }
   }
   return true;
 }
+
 
 // DnnlElementwiseNodeCapability class
 //-------------------------------------
@@ -458,7 +547,7 @@ bool DnnlElementwiseCapability::IsDimensionSupported(const Node* node) const {
   if (dnnl_engine_get_count(dnnl_engine_kind_t::dnnl_gpu)) {
     if(node_inputs[0]->Shape()->dim_size() > 5 ){
       return false;
-    } 
+    }
   }
 
   return true;
@@ -834,13 +923,6 @@ bool DnnlQAttentionNodeCapability::Supported(const Node* node, const GraphViewer
     return false;
   }
 
-  //qattention is disabled on gpu due to the following onednn bugs
-  //1. flipped zero points in int8 matmul
-  //2. unsupported runtime input source0 scaling in binary
-  //3. f32 matmul on submemory gives wrong result
-  if (dnnl_engine_get_count(dnnl_engine_kind_t::dnnl_gpu)) {
-    return false;
-  }
   return true;
 }
 
@@ -849,5 +931,240 @@ bool DnnlQAttentionNodeCapability::IsDimensionSupported(const Node* node) const 
   return true;
 }
 
+// DnnlCastNodeCapability class
+//-------------------------------------
+DnnlCastNodeCapability::DnnlCastNodeCapability(std::vector<ORT_DataType> validTypes)
+                        : DnnlDefaultNodeCapability(validTypes) {
+  for (ORT_DataType datatype : validTypes)
+    validTypes_.push_back(datatype);
+}
+
+bool DnnlCastNodeCapability::Supported(const Node* node, const GraphViewer& graph_viewer) const {
+  ORT_UNUSED_PARAMETER(graph_viewer);
+  if (!IsTypeSupported(node) || !IsCastSupported(node)) return false;
+  return true;
+}
+
+bool DnnlCastNodeCapability::IsCastSupported(const Node* node) const {
+  // Get input and attributes
+  const NodeAttributes& node_attr = node->GetAttributes();
+  auto node_input = node->InputDefs();
+  auto attr_to = node_attr.find("to");
+
+  // If we have valid results
+  if (!node_input.empty() &&
+      node_input[0]->TypeAsProto() != nullptr &&
+      attr_to != node_attr.end()) {
+
+    // Get the input and cast target type
+    auto input_type = node_input[0]->TypeAsProto()->tensor_type().elem_type();
+    auto cast_type = attr_to->second().i();
+
+    // Some FP16 operations are not supported yet on CPU
+#if defined(DNNL_CPU_RUNTIME)
+    // From uint8 and int8 => To Float16
+    if ((input_type == type_uint8 ||
+         input_type == type_int8) &&
+         cast_type == type_float16) {
+      return false;
+    }
+    // From uint32 => To Float16 and BFloat16
+    if (input_type == type_int32    &&
+       (cast_type == type_float16   ||
+        cast_type == type_bfloat16)) {
+      return false;
+    }
+    // From Float16 => To int(uint8, int8 and int32) and BFloat16
+    if (input_type == type_float16  &&
+        (cast_type == type_uint8    ||
+         cast_type == type_int8     ||
+         cast_type == type_int32    ||
+         cast_type == type_bfloat16)) {
+      return false;
+    }
+    // From BFloat16 => To int32 and BFloat16
+    if (input_type == type_bfloat16 &&
+        (cast_type == type_int32    ||
+         cast_type == type_float16)) {
+      return false;
+    }
+#endif  // defined(DNNL_CPU_RUNTIME)
+
+    // Check if the cast type is supported
+    for (auto validType : validTypes_) {
+      if (validType == cast_type) {
+        return true;
+      }
+    }
+
+  }
+
+  return false;
+}
+
+bool DnnlDequantizeLinearNodeCapability::Supported(const Node* node, const GraphViewer& graph_viewer) const {
+  ORT_UNUSED_PARAMETER(graph_viewer);
+  if (!IsTypeSupported(node)) return false;
+  return true;
+}
+
+bool DnnlLayerNormalizationNodeCapability::Supported(const Node* node, const GraphViewer& graph_viewer) const {
+  ORT_UNUSED_PARAMETER(graph_viewer);
+  if (!IsTypeSupported(node)) return false;
+  if (!IsTrainingSupported(node)) return false;
+  if (!IsDimensionSupported(node)) return false;
+  return true;
+}
+
+bool DnnlLayerNormalizationNodeCapability::IsAxisSupported(const Node* node) const {
+  // At the moment of implementation OneDNN does not support broadcasting
+  // on LayerNorm so we can only accept the op when the normalization
+  // is done on the last dim
+  const NodeAttributes& attr = node->GetAttributes();
+  auto axis = attr.find("axis");
+
+  if (axis != attr.end()) {
+    // Get the norm dim
+    auto norm_dim = axis->second().i();
+    // Get the input dims
+    auto input_dims = node->InputDefs()[0]->Shape()->dim_size();
+
+    // If the axis is not the last dim, it's not supported
+    if ((norm_dim != -1) && (norm_dim != (input_dims - 1))) {
+      return false;
+    }
+  }
+  // If no axis is provided or the conditions above were not met,
+  // we normalize on the last dim
+  return true;
+}
+
+bool DnnlLayerNormalizationNodeCapability::IsTrainingSupported(const Node* node) const {
+  // Get the output defs
+  auto num_outputs = node->OutputDefs().size();
+  // Training support is in progress, for the moment we don't support multiple outputs
+  if (num_outputs > 1) {
+    return false;
+  } else {
+    return true;
+  }
+}
+bool DnnlLayerNormalizationNodeCapability::IsDimensionSupported(const Node* node) const {
+  // Get the input shape
+  auto input_shape = node->InputDefs()[0]->Shape();
+
+  if (input_shape != nullptr) {
+    auto input_dims = input_shape->dim_size();
+    // OneDNN is supports from 2D to 5D tensors
+    if ((input_dims <= 5) && (input_dims >= 2)) {
+      return true;
+
+    // If the tensor is 1D or >6D then we dont support it
+    } else {
+      return false;
+    }
+  }
+  // If we dont have shape info, accept the data and catch the error on the implementation
+  return true;
+}
+
+// DnnlConcatNodeCapability class
+//-------------------------------------
+
+bool DnnlConcatNodeCapability::Supported(const Node* node, const GraphViewer& graph_viewer) const {
+  ORT_UNUSED_PARAMETER(graph_viewer);
+  if (!IsTypeSupported(node)) {
+    return false;
+  }
+  if (!AreAllInputsOfSameType(node)) {
+    return false;
+  }
+  if (!AreAxisAndDimensionsSupported(node)) {
+    return false;
+  }
+  return true;
+}
+
+bool DnnlConcatNodeCapability::AreAllInputsOfSameType(const Node* node) const {
+  // All inputs must be of the same type
+  const auto node_inputs = node->InputDefs();
+  if (!node_inputs.empty() && node_inputs[0]->TypeAsProto() != nullptr) {
+    const auto ref_datatype = node_inputs[0]->TypeAsProto()->tensor_type().elem_type();
+    // Ensure that other inputs have the same datatype as the first
+    for (size_t i=1; i<node_inputs.size(); ++i) {
+      if (node_inputs[i]->TypeAsProto() != nullptr &&
+          node_inputs[i]->TypeAsProto()->tensor_type().elem_type() != ref_datatype) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool DnnlConcatNodeCapability::AreAxisAndDimensionsSupported(const Node* node) const {
+  auto& attributes = node->GetAttributes();
+  auto axis_attr = attributes.find("axis");
+  if (axis_attr != attributes.end()) {
+    if (axis_attr->second().type() != ::ONNX_NAMESPACE::AttributeProto_AttributeType::AttributeProto_AttributeType_INT) {
+      // Axis must be an integer
+        return false;
+    }
+  }
+  else {
+    // Axis is required
+    return false;
+  }
+
+  int64_t signed_axis = axis_attr->second().i();
+
+  // Veriy input dimensions
+  const auto& node_inputs = node->InputDefs();
+  auto ref_input_it = std::find_if(node_inputs.begin(), node_inputs.end(), 
+                      [](const auto input) {
+                        return input->Shape() != nullptr;
+                      });
+  if (ref_input_it != node_inputs.end()) {
+    const auto ref_input = *ref_input_it;
+    const auto ref_input_shape = ref_input->Shape();
+    const auto ref_input_rank = ref_input_shape->dim_size();
+
+    // DNNL only supports tensors of 6 or fewer dimensions on GPU  
+    if (dnnl_engine_get_count(dnnl_engine_kind_t::dnnl_gpu)) {
+      if(ref_input_rank > 6 ){
+        return false;
+      }
+    }  
+
+    // Verify that input tensors match shapes except on the axis dimension.
+    const auto adjusted_axis = (signed_axis >= 0) ? signed_axis : signed_axis + ref_input_rank;
+    for (auto input : node_inputs) {
+      if (input == ref_input) {
+        continue;
+      }
+      
+      const auto input_shape = input->Shape();
+      if (input_shape == nullptr) {
+        continue;
+      }
+      if (input_shape->dim_size() != ref_input_rank) {
+        // Rank doesn't match reference input.
+        return false;
+      }
+      for (int d=0; d<ref_input_rank; ++d) {
+        if (d == adjusted_axis) {
+          continue;
+        }
+        const auto& ref_input_dim = ref_input_shape->dim(d);
+        const auto& input_dim = input_shape->dim(d);
+        if (ref_input_dim.has_dim_value() && input_dim.has_dim_value()) {
+          if (ref_input_dim.dim_value() != input_dim.dim_value()) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
 
 }  // namespace onnxruntime

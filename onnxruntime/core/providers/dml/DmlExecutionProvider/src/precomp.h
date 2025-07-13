@@ -24,11 +24,21 @@
 #include <wil/wrl.h>
 #include <wil/result.h>
 
-#include <gsl/gsl>
+#include "core/common/gsl.h"
 
+#ifdef _GAMING_XBOX_SCARLETT
+#include <d3d12_xs.h>
+#include <d3dx12_xs.h>
+#elif defined(_GAMING_XBOX_XBOXONE)
+#include <d3d12_x.h>
+#include <d3dx12_x.h>
+#else // Desktop
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include "External/D3DX12/d3dx12.h"
+#endif
+
+#include "GraphicsUnknownHelper.h"
 
 #include <DirectML.h>
 #include "core/common/common.h"
@@ -42,6 +52,7 @@
 #include "External/DirectMLHelpers/GeneratedSchemaTypes.h"
 #include "External/DirectMLHelpers/SchemaHelpers.h"
 #include "External/DirectMLHelpers/GeneratedSchemaHelpers.h"
+#include "External/DirectMLHelpers/DirectMLX.h"
 
 using Microsoft::WRL::ComPtr;
 

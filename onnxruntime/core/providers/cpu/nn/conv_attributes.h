@@ -28,25 +28,27 @@ struct ConvAttributes {
     kernel_shape_specified = info.GetAttrs("kernel_shape", kernel_shape_).IsOK();
 
     status = info.GetAttrs("strides", strides);
-    if (!status.IsOK() || strides.empty()) {
+    if (kernel_shape_specified && (!status.IsOK() || strides.empty())) {
       strides.resize(kernel_shape_.size(), 1);
     }
 
     gsl::span<const int64_t> pads_span;
     status = info.GetAttrsAsSpan("pads", pads_span);
     if (!status.IsOK()) {
-      // If pads are not explicitly provided, fill the container with all zeros
-      // so that we can compute and fill in pad values downstream
-      pads.resize(kernel_shape_.size() * 2, 0);
+      if (kernel_shape_specified) {
+        // If pads are not explicitly provided, fill the container with all zeros
+        // so that we can compute and fill in pad values downstream
+        pads.resize(kernel_shape_.size() * 2, 0);
+      }
     } else {
       // Pads are explicitly provided, make sure that auto_pad is NOTSET
       ORT_ENFORCE(auto_pad == AutoPadType::NOTSET,
                   "A Conv/ConvTranspose node has both 'auto_pad' and 'pads' attributes");
-      pads.assign(pads_span.cbegin(), pads_span.cend());
+      pads.assign(pads_span.begin(), pads_span.end());
     }
 
     status = info.GetAttrs("dilations", dilations);
-    if (!status.IsOK() || dilations.empty()) {
+    if (kernel_shape_specified && (!status.IsOK() || dilations.empty())) {
       dilations.resize(kernel_shape_.size(), 1);
     }
 
@@ -71,7 +73,7 @@ struct ConvAttributes {
 
   ~ConvAttributes() = default;
 
-  Status ComputeKernelShape(const TensorShape& weight_shape, TensorShapeVector& kernel_shape) const {
+  Status ComputeKernelShape(const TensorShape& weight_shape, TensorShapeVector& kernel_shape, bool weight_channels_last = false) const {
     if (kernel_shape_specified) {
       kernel_shape = kernel_shape_;
       if (kernel_shape.size() + 2 != weight_shape.NumDimensions()) {
@@ -80,15 +82,20 @@ struct ConvAttributes {
                                " W: ", weight_shape.ToString().c_str());
       }
       for (size_t i = 0; i < kernel_shape.size(); ++i) {
-        if (kernel_shape[i] != weight_shape[i + 2]) {
+        if (kernel_shape[i] != weight_shape[i + (weight_channels_last ? 1 : 2)]) {
           return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "kernel_shape is not compatible with W shape.",
                                  " kernel_shape: ", TensorShape(kernel_shape).ToString().c_str(),
-                                 " W: ", weight_shape.ToString().c_str());
+                                 " W: ", weight_shape.ToString().c_str(),
+                                 " channels_last: ", weight_channels_last);
         }
       }
     } else {
       auto weight_dims = weight_shape.GetDims();
-      kernel_shape.assign(weight_dims.begin() + 2, weight_dims.end());
+      if (weight_channels_last) {
+        kernel_shape.assign(weight_dims.begin() + 1, weight_dims.end() - 1);
+      } else {
+        kernel_shape.assign(weight_dims.begin() + 2, weight_dims.end());
+      }
     }
 
     return Status::OK();
@@ -96,7 +103,8 @@ struct ConvAttributes {
 
   Status ValidateInputShape(const TensorShape& input_shape,
                             const TensorShape& weight_shape,
-                            bool channels_last = false) const {
+                            bool input_channels_last = false,
+                            bool weight_channels_last = false) const {
     if (input_shape.NumDimensions() != weight_shape.NumDimensions()) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "X num_dims does not match W num_dims.",
                              " X: ", input_shape.ToString().c_str(),
@@ -104,9 +112,9 @@ struct ConvAttributes {
     }
 
     const int64_t M = weight_shape[0];
-    const int64_t C = channels_last ? input_shape.GetDims().back() : input_shape[1];
+    const int64_t C = input_channels_last ? input_shape.GetDims().back() : input_shape[1];
 
-    if (C != weight_shape[1] * group) {
+    if (C != (weight_channels_last ? weight_shape.GetDims().back() : weight_shape[1]) * group) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Input channels C is not equal to kernel channels * group.",
                              " C: ", C,
                              " kernel channels: ", weight_shape[1],
@@ -125,13 +133,13 @@ struct ConvAttributes {
     return ValidateInputShape(input->Shape(), weight->Shape());
   }
 
-  Status InferOutputShape(const TensorShape& input_shape,
-                          const gsl::span<const int64_t>& kernel_shape,
-                          const gsl::span<const int64_t>& strides_p,
-                          const gsl::span<const int64_t>& dilations_p,
-                          ConvPadVector& pads_p,
-                          TensorShapeVector& output_shape,
-                          bool force_symmetric_auto_padding = false) const {
+  Status InferPadsAndOutputShape(const TensorShape& input_shape,
+                                 const gsl::span<const int64_t>& kernel_shape,
+                                 const gsl::span<const int64_t>& strides_p,
+                                 const gsl::span<const int64_t>& dilations_p,
+                                 ConvPadVector& pads_p,
+                                 TensorShapeVector& output_shape,
+                                 bool force_symmetric_auto_padding = false) const {
     size_t rank = input_shape.NumDimensions();
 
     // Make sure all "metadata" containers have the right number of elements
@@ -158,8 +166,7 @@ struct ConvAttributes {
                                                    kernel_shape[dim],
                                                    dilations_p[dim],
                                                    auto_pad,
-                                                   pads_p.at(dim),
-                                                   pads_p.at(input_shape.NumDimensions() + dim),
+                                                   pads_p[dim], pads_p[rank + dim],
                                                    output_dim_size,
                                                    force_symmetric_auto_padding));
       if (output_dim_size <= 0) {

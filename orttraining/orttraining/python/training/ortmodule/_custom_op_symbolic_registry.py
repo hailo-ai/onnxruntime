@@ -3,10 +3,36 @@
 # Licensed under the MIT License.
 # --------------------------------------------------------------------------
 
-from torch.onnx import register_custom_op_symbolic
-from torch.onnx.symbolic_helper import parse_args, _get_tensor_dim_size, _get_tensor_sizes
-import torch.onnx.symbolic_helper as sym_help
+import warnings
+
 import torch
+import torch.onnx.symbolic_helper as sym_help
+from packaging.version import Version
+from torch.onnx import register_custom_op_symbolic
+from torch.onnx.symbolic_helper import _get_tensor_dim_size, _get_tensor_sizes, parse_args
+
+from onnxruntime.training import ortmodule
+
+
+def wrap_custom_export_function(original_func):
+    # Starting from PyTorch 1.11, there has been a change to symbolic function signature
+    # in terms of how additional context is accessed. More info at
+    # https://github.com/pytorch/pytorch/blob/6b02648479d3615fa3260961e24f38dd0f22da94/torch/onnx/symbolic_helper.py#L48
+    # This code can be cleaned up once support for PyTorch version < 1.11 is dropped.
+    try:
+        from torch.onnx import SymbolicContext
+
+        def _export_with_ctx(ctx: SymbolicContext, graph, *args, **kwargs):
+            node = ctx.cur_node
+            return original_func(graph, node, *args, **kwargs)
+
+        return _export_with_ctx
+    except ImportError:
+
+        def _export_with_no_ctx(graph, *args, **kwargs):
+            return original_func(graph, None, *args, **kwargs)
+
+        return _export_with_no_ctx
 
 
 class CustomOpSymbolicRegistry:
@@ -14,129 +40,235 @@ class CustomOpSymbolicRegistry:
 
     @classmethod
     def register(cls, name, domain, fn):
-        cls._SYMBOLICS[domain + '::' + name] = fn
+        cls._SYMBOLICS[domain + "::" + name] = fn
 
     @classmethod
     def register_all(cls):
         for name, fn in cls._SYMBOLICS.items():
             # Symbolic name is in format: domain::name
-            register_custom_op_symbolic(name, fn, 1)
+            register_custom_op_symbolic(
+                name,
+                fn,
+                ortmodule._defined_from_envvar("ORTMODULE_ONNX_OPSET_VERSION", ortmodule.ONNX_OPSET_VERSION),
+            )
 
 
-def register_symbolic(name, domain=''):
+def register_symbolic(name, domain="", torch_version_start=None, torch_version_end=None, need_node=False):
     def symbolic_wrapper(fn):
-        CustomOpSymbolicRegistry.register(name, domain, fn)
-        return fn
+        need_register = True
+        if torch_version_start is not None and Version(torch.__version__) < Version(torch_version_start):
+            need_register = False
+        # torch_version_end is exclusive.
+        if torch_version_end is not None and Version(torch.__version__) >= Version(torch_version_end):
+            need_register = False
+
+        updated_fn = fn
+        if need_node is True:
+            updated_fn = wrap_custom_export_function(fn)
+
+        if need_register:
+            CustomOpSymbolicRegistry.register(name, domain, updated_fn)
+        return updated_fn
+
     return symbolic_wrapper
 
 
-@register_symbolic('cross_entropy_loss')
-@parse_args('v', 'v', 'v', 'i', 'v', 'v')
-def cross_entropy_loss(g, self, target, weight, reduction, ignore_index, label_smoothing=0.0):
+@register_symbolic("cross_entropy_loss", need_node=True)
+def cross_entropy_loss(g, node, logits, target, weight, reduction, ignore_index, label_smoothing=0.0):
     label_smoothing = sym_help._maybe_get_const(label_smoothing, "f")
     if label_smoothing > 0.0:
         raise RuntimeError("Unsupported: ONNX does not support label_smoothing")
 
+    logits_casted = logits
+    weight_casted = weight
+    output_type = None
+
+    #####################################################################################################
+    # Workaround: cross_entropy_loss takes fp16 as input and generates fp32 output.
+    # sample aten graph:
+    #     %target : Long(16, strides=[1], requires_grad=0, device=cuda:0)
+    #     %input : Half(16, 3, strides=[3, 1], requires_grad=0, device=cuda:0) = aten::linear(%18, %13, %19)
+    #     Float(requires_grad=0, device=cuda:0) = aten::cross_entropy_loss(%input, %target, %21, %22, %23, %24)
+    # If ORT do the compute with the input data type, the scaled loss gradient will become inf (cannot represented
+    # with fp16). Here we try to cast the fp16 to fp32 based on the export context (if there is).
+    # Currently not all type promotion/demotion are considered, only fp16 to fp32 is considered. For others, they
+    # remain the same behavior as before, but leave a warning message.
+
+    if not node:
+        # For lower version torch we cannot get node output types, we do the type promotion for safety.
+        # Assume a failure will happen if a non-float32 result is expected.
+        if logits.type().scalarType() == "Half":
+            logits_casted = g.op("Cast", logits, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+
+        if not weight.node().mustBeNone() and weight.type().scalarType() == "Half":
+            weight_casted = g.op("Cast", weight, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+
+        output_type = logits_casted.type()
+    else:
+        # For higher version torch we can get node output types, only adding cast for known type promotion cases.
+        loss_output = list(node.outputs())[0]
+        loss_scalar_type = loss_output.type().scalarType()
+        logits_scalar_type = logits.type().scalarType()
+        if loss_scalar_type != logits_scalar_type and logits_scalar_type == "Half" and loss_scalar_type == "Float":
+            # TODO: remove the cast once SoftmaxCrossEntropyLossInternal supports fp16 input and fp32 output.
+            logits_casted = g.op("Cast", logits, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+            if not weight.node().mustBeNone():
+                if weight.type().scalarType() == "Half":
+                    weight_casted = g.op("Cast", weight, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+                else:
+                    warnings.warn(
+                        "Unsupported diverged input and output types for weight when export cross_entropy_loss."
+                        f"weight type: {weight.type().scalarType()}, loss type: {loss_scalar_type}"
+                    )
+
+        else:
+            warnings.warn(
+                "Unsupported diverged input and output types for logits when export cross_entropy_loss."
+                f"logits type: {logits_scalar_type}, loss type: {loss_scalar_type}"
+            )
+
+        output_type = loss_output.type()
+    # End of workaround
+    ##################################
+
     # reduction: 0->none, 1->mean, 2->sum
-    reduction = sym_help._maybe_get_const(reduction, 'i')
-    reduction_vals = ['none', 'mean', 'sum']
+    reduction = sym_help._maybe_get_const(reduction, "i")
+    reduction_vals = ["none", "mean", "sum"]
     reduction = reduction_vals[reduction]
-    output, log_prob = g.op("com.microsoft::SoftmaxCrossEntropyLossInternal",
-                            self, target, weight, ignore_index,
-                            reduction_s=reduction, outputs=2)
-    output.setType(self.type())
-    log_prob.setType(self.type())
+
+    output, log_prob = g.op(
+        "com.microsoft::SoftmaxCrossEntropyLossInternal",
+        logits_casted,
+        target,
+        weight_casted,
+        ignore_index,
+        reduction_s=reduction,
+        outputs=2,
+    )
+    output.setType(output_type)
+    log_prob.setType(output_type)
     return output
 
 
-@register_symbolic('nll_loss')
-@parse_args('v', 'v', 'v', 'i', 'v')
+@register_symbolic("nll_loss")
+@parse_args("v", "v", "v", "i", "v")
 def nll_loss(g, self, target, weight, reduction, ignore_index):
     # reduction: 0->none, 1->mean, 2->sum
-    reduction = sym_help._maybe_get_const(reduction, 'i')
-    reduction_vals = ['none', 'mean', 'sum']
+    reduction = sym_help._maybe_get_const(reduction, "i")
+    reduction_vals = ["none", "mean", "sum"]
     reduction = reduction_vals[reduction]
-    output = g.op("com.microsoft::NegativeLogLikelihoodLossInternal",
-                    self, target, weight, ignore_index, reduction_s=reduction)
+    output = g.op(
+        "com.microsoft::NegativeLogLikelihoodLossInternal", self, target, weight, ignore_index, reduction_s=reduction
+    )
     output.setType(self.type())
     return output
 
 
-@register_symbolic('embedding')
+@register_symbolic("embedding")
 def embedding(g, weight, indices, padding_idx, scale_grad_by_freq, sparse):
-    output = g.op("org.pytorch.aten::ATen", weight, indices, padding_idx, scale_grad_by_freq, sparse,
-                  operator_s='aten::embedding')
+    output = g.op(
+        "org.pytorch.aten::ATen", weight, indices, padding_idx, scale_grad_by_freq, sparse, operator_s="embedding"
+    )
     indices_shape = _get_tensor_sizes(indices)
-    if indices_shape is not None and hasattr(weight.type(), 'with_sizes'):
-        output_type = weight.type().with_sizes(
-            indices_shape + [_get_tensor_dim_size(weight, 1)])
+    if indices_shape is not None and hasattr(weight.type(), "with_sizes"):
+        output_type = weight.type().with_sizes(indices_shape + [_get_tensor_dim_size(weight, 1)])
         output.setType(output_type)
     return output
 
-@register_symbolic('bitwise_or')
+
+@register_symbolic("bitwise_or")
 def bitwise_or(g, self, other):
-    return g.op("org.pytorch.aten::ATen", self, other,
-                operator_s='aten::bitwise_or', overload_name_s='Tensor')
+    return g.op("org.pytorch.aten::ATen", self, other, operator_s="bitwise_or", overload_name_s="Tensor")
 
-@register_symbolic('diagonal')
+
+@register_symbolic("diagonal")
 def diagonal(g, self, offset, dim1, dim2):
-    return g.op("org.pytorch.aten::ATen", self, offset, dim1, dim2,
-                operator_s='aten::diagonal')
+    return g.op("org.pytorch.aten::ATen", self, offset, dim1, dim2, operator_s="diagonal")
 
 
-@register_symbolic('multinomial')
+@register_symbolic("multinomial")
 def multinomial(g, self, num_samples, replacement=False, generator=None):
     if generator is not None and not sym_help._is_none(generator):
         raise RuntimeError("Unsupported: ONNX does not support generator for multinomial")
-    return g.op("org.pytorch.aten::ATen", self, num_samples, replacement, generator,
-                operator_s='aten::multinomial')
+    return g.op("org.pytorch.aten::ATen", self, num_samples, replacement, generator, operator_s="multinomial")
 
 
-@register_symbolic('max_pool2d')
+@register_symbolic("max_pool2d")
 def max_pool2d(g, self, kernel_size, stride, padding, dilation, ceil_mode):
-    stride_val = sym_help._maybe_get_const(stride, 'is')
+    stride_val = sym_help._maybe_get_const(stride, "is")
     if not stride_val:
         stride = kernel_size
-    return g.op("org.pytorch.aten::ATen", self, kernel_size, stride, padding, dilation, ceil_mode,
-                operator_s='aten::max_pool2d_with_indices', outputs=2)[0]
+    return g.op(
+        "org.pytorch.aten::ATen",
+        self,
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        ceil_mode,
+        operator_s="max_pool2d_with_indices",
+        outputs=2,
+    )[0]
 
 
-@register_symbolic('unfold')
+@register_symbolic("max")
+def max(g, self, dim_or_y=None, keepdim=None):
+    # torch.max(input), returns the max value in the tensor
+    if dim_or_y is None and keepdim is None:
+        return g.op("org.pytorch.aten::ATen", self, operator_s="max")
+    # torch.max(input, other)
+    if keepdim is None:
+        return g.op("Max", self, dim_or_y)
+    # torch.max(input, dim, keepdim), returns (max_values, max_indices)
+    return g.op("org.pytorch.aten::ATen", self, dim_or_y, keepdim, operator_s="max", overload_name_s="dim", outputs=2)
+
+
+@register_symbolic("min")
+def min(g, self, dim_or_y=None, keepdim=None):
+    # torch.min(input), returns the min value in the tensor
+    if dim_or_y is None and keepdim is None:
+        return g.op("org.pytorch.aten::ATen", self, operator_s="min")
+    # torch.min(input, other)
+    if keepdim is None:
+        return g.op("Min", self, dim_or_y)
+    # torch.min(input, dim, keepdim), returns (min_values, min_indices)
+    return g.op("org.pytorch.aten::ATen", self, dim_or_y, keepdim, operator_s="min", overload_name_s="dim", outputs=2)
+
+
+@register_symbolic("unfold")
 def unfold(g, input, dimension, size, step):
-    return g.op("org.pytorch.aten::ATen", input, dimension, size, step, operator_s='aten::unfold')
+    return g.op("org.pytorch.aten::ATen", input, dimension, size, step, operator_s="unfold")
 
 
-@register_symbolic('argmax')
+@register_symbolic("argmax")
 def argmax(g, input, dim, keepdim):
-    return g.op("org.pytorch.aten::ATen", input, dim, keepdim, operator_s='aten::argmax')
+    return g.op("org.pytorch.aten::ATen", input, dim, keepdim, operator_s="argmax")
 
 
-@register_symbolic('avg_pool2d')
+@register_symbolic("avg_pool2d")
 def avg_pool2d(g, self, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override):
-    stride_val = sym_help._maybe_get_const(stride, 'is')
+    stride_val = sym_help._maybe_get_const(stride, "is")
     if not stride_val:
         stride = kernel_size
-    return g.op("org.pytorch.aten::ATen", self, kernel_size, stride, padding, ceil_mode,
-                count_include_pad, divisor_override, operator_s='aten::avg_pool2d')
+    return g.op(
+        "org.pytorch.aten::ATen",
+        self,
+        kernel_size,
+        stride,
+        padding,
+        ceil_mode,
+        count_include_pad,
+        divisor_override,
+        operator_s="avg_pool2d",
+    )
 
 
-@register_symbolic('adaptive_avg_pool2d')
+@register_symbolic("adaptive_avg_pool2d")
 def adaptive_avg_pool2d(g, self, output_size):
-    return g.op("org.pytorch.aten::ATen", self, output_size, operator_s='aten::_adaptive_avg_pool2d')
+    return g.op("org.pytorch.aten::ATen", self, output_size, operator_s="_adaptive_avg_pool2d")
 
 
-@register_symbolic('binary_cross_entropy_with_logits')
-def binary_cross_entropy_with_logits(g, self, target, weight, pos_weight, reduction):
-    # If weight is not None, we need to check if it requires grad and add gradient graph accordingly.
-    # But current custom_gradient_registry doesn't support such None checking,
-    # So doesn't support non-None weight for now.
-    if weight is None or sym_help._is_none(weight):
-        return g.op("org.pytorch.aten::ATen", self, target, weight, pos_weight, reduction,
-                    operator_s='aten::binary_cross_entropy_with_logits')
-    from torch.onnx.symbolic_opset12 import binary_cross_entropy_with_logits as bce
-    return bce(g, self, target, weight, pos_weight, reduction)
-
-@register_symbolic('numpy_T')
+@register_symbolic("numpy_T")
 def numpy_T(g, self):
     # Numpy-style `a.T`: returns the tensor
     # with dims reversed
@@ -147,16 +279,60 @@ def numpy_T(g, self):
     else:
         # if we don't have dim information we cannot
         # output a permute so use ATen instead
-        return g.op("com.microsoft::ATenOp", self, name_s='aten::numpy_T')
+        return g.op("org.pytorch.aten::ATen", self, operator_s="numpy_T")
+
+
+@register_symbolic("squeeze")
+def squeeze(g, self, dim=None):
+    # Current _infer_If does not correctly infer shapes from its then- and else- branches, and will
+    # cause error in shape inference of following nodes, here we choose to export it as `Squeeze.`
+    from torch.onnx.symbolic_opset11 import squeeze as squeeze_with_if
+
+    if dim is None:
+        return squeeze_with_if(g, self, dim)
+    squeeze_dim = sym_help._get_const(dim, "i", "dim")
+    return sym_help._squeeze_helper(g, self, axes_i=[squeeze_dim])
+
+
+# Exporter's prim::ConstantChunk uses multiple Slice nodes, which is fine for inference.
+# For training, the gradient graph will be multiple SliceGrad and one Sum, which is inefficient compared to
+# exporting to Split with SplitGrad as gradient graph.
+# Exporter will fail to register symbolic with non-empty domain when torch version is < 1.11.0.
+@register_symbolic("ConstantChunk", "prim", torch_version_start="1.11.0")
+def prim_ConstantChunk(g, self, chunks, dim):
+    if chunks == 1:
+        return self
+    input_shape_dim = g.op(
+        "Gather", g.op("Shape", self), g.op("Constant", value_t=torch.tensor([dim], dtype=torch.long)), axis_i=0
+    )
+    chunk_size_minus_1 = g.op("Constant", value_t=torch.tensor([chunks - 1], dtype=torch.long))
+    chunk_dim = g.op(
+        "Div",
+        g.op("Add", input_shape_dim, chunk_size_minus_1),
+        g.op("Constant", value_t=torch.tensor([chunks], dtype=torch.long)),
+    )
+    return g.op(
+        "Split",
+        self,
+        g.op(
+            "Concat",
+            g.op("Expand", chunk_dim, chunk_size_minus_1),
+            g.op("Sub", input_shape_dim, g.op("Mul", chunk_dim, chunk_size_minus_1)),
+            axis_i=0,
+        ),
+        axis_i=dim,
+        outputs=chunks,
+    )
+
 
 # For torch.einsum.
 def parse_equation(equation):
-    pos_comma = equation.find(',')
-    pos_arrow = equation.find('->')
+    pos_comma = equation.find(",")
+    pos_arrow = equation.find("->")
     assert pos_comma != -1 and pos_arrow > pos_comma
-    lhs_labels = [label for label in equation[:pos_comma] if label != ' ']
-    rhs_labels = [label for label in equation[pos_comma + 1:pos_arrow] if label != ' ']
-    result_labels = [label for label in equation[pos_arrow + 2:] if label != ' ']
+    lhs_labels = [label for label in equation[:pos_comma] if label != " "]
+    rhs_labels = [label for label in equation[pos_comma + 1 : pos_arrow] if label != " "]
+    result_labels = [label for label in equation[pos_arrow + 2 :] if label != " "]
     # Two operands and result are not empty, and are all alpha characters.
     assert lhs_labels and rhs_labels and result_labels
     assert all(label.isalpha() for label in lhs_labels + rhs_labels + result_labels)
@@ -165,8 +341,10 @@ def parse_equation(equation):
     assert all(label in lhs_labels or label in rhs_labels for label in result_labels)
     return lhs_labels, rhs_labels, result_labels
 
+
 def need_permute(perm):
     return any(idx != axis for idx, axis in enumerate(perm))
+
 
 def map_labels_to_output(input_labels, label_perm_map):
     output_len = len(label_perm_map)
@@ -187,6 +365,7 @@ def map_labels_to_output(input_labels, label_perm_map):
 
     return perm, unsqueeze_axes
 
+
 def unsqueeze_and_permute_for_mul(g, tensor, unsqueeze_axes, perm):
     # If perm is sorted after removing unsqueeze axes, then permute is not needed.
     # For example, a.unsqueeze(2).permute([0, 2, 1]) is same as a.unsqueeze(1).
@@ -202,6 +381,7 @@ def unsqueeze_and_permute_for_mul(g, tensor, unsqueeze_axes, perm):
         tensor = g.op("Transpose", tensor, perm_i=perm)
     return tensor
 
+
 def combine_unsqueeze_and_permute_for_matmul(unsqueeze_axes, perm1, perm2):
     # When going here, the unsqueeze axes must be some axes at the end.
     # We can combine two permutes and remove unsqueeze axes, because we will reshape it after this.
@@ -211,25 +391,42 @@ def combine_unsqueeze_and_permute_for_matmul(unsqueeze_axes, perm1, perm2):
     new_perm = [axis for axis in new_perm if axis not in unsqueeze_axes]
     return new_perm
 
+
 def is_axes_contiguous(axes):
     return len(axes) < 2 or all(axes[axis] + 1 == axes[axis + 1] for axis in range(len(axes) - 1))
+
 
 def get_shape_tensor_by_axes(g, input, input_shape, axes, need_numel_shape):
     if input_shape is None:
         input_shape = g.op("Shape", input)
-    shape_tensor = g.op("Gather", input_shape, g.op("Constant", value_t=torch.tensor(axes, dtype=torch.int64)), axis_i=0)
+    shape_tensor = g.op(
+        "Gather", input_shape, g.op("Constant", value_t=torch.tensor(axes, dtype=torch.int64)), axis_i=0
+    )
     numel_shape_tensor = None
     if need_numel_shape:
         assert len(axes) > 1
         numel_shape_tensor = g.op("ReduceProd", shape_tensor)
     return shape_tensor, numel_shape_tensor, input_shape
 
+
 def reshape_tensor(g, input, shape_tensors):
     shape_tensor = g.op("Concat", *shape_tensors, axis_i=0) if len(shape_tensors) > 1 else shape_tensors[0]
     return g.op("Reshape", input, shape_tensor)
 
-def permute_and_reshape_tensor(g, tensor, is_lhs, rank, perm, matmul_output_axes, contraction_axes,
-                               batch_length, matmul_output_numel_tensor, contraction_numel_tensor, shape_tensor):
+
+def permute_and_reshape_tensor(
+    g,
+    tensor,
+    is_lhs,
+    rank,
+    perm,
+    matmul_output_axes,
+    contraction_axes,
+    batch_length,
+    matmul_output_numel_tensor,
+    contraction_numel_tensor,
+    shape_tensor,
+):
     # If matmul_output_axes and contraction_axes are contiguous in input tensor,
     # we can move Reshape to before Transpose, so it's possible that the Transpoase is fused to MatMul.
     # Otherwise, we have to Transpose first to move those axes together and then Reshape.
@@ -251,7 +448,7 @@ def permute_and_reshape_tensor(g, tensor, is_lhs, rank, perm, matmul_output_axes
             else:
                 new_tensor = sym_help._unsqueeze_helper(g, tensor, [batch_length if is_lhs else -1])
         else:
-            axes_to_remove = contraction_axes[1:]   # contraction_axes can't be empty.
+            axes_to_remove = contraction_axes[1:]  # contraction_axes can't be empty.
             if len(matmul_output_axes) > 1:
                 axes_to_remove = axes_to_remove + matmul_output_axes[1:]
             remaining_axes = [axis for axis in range(rank) if axis not in axes_to_remove]
@@ -275,7 +472,8 @@ def permute_and_reshape_tensor(g, tensor, is_lhs, rank, perm, matmul_output_axes
                     has_neg_one_dim = True
                 else:
                     single_axis_shape_tensor, _, shape_tensor = get_shape_tensor_by_axes(
-                        g, tensor, shape_tensor, [axis], False)
+                        g, tensor, shape_tensor, [axis], False
+                    )
                     shape_tensors.append(single_axis_shape_tensor)
             if not has_neg_one_dim and last_zero_dim >= 0:
                 shape_tensors[last_zero_dim] = g.op("Constant", value_t=torch.tensor([-1], dtype=torch.int64))
@@ -300,27 +498,42 @@ def permute_and_reshape_tensor(g, tensor, is_lhs, rank, perm, matmul_output_axes
         shape_tensors = [g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64))] * batch_length
         if is_lhs:
             if matmul_output_numel_tensor is None:
-                matmul_output_numel_tensor = g.op("Constant", value_t=torch.tensor([1 - len(matmul_output_axes)], dtype=torch.int64))
+                matmul_output_numel_tensor = g.op(
+                    "Constant", value_t=torch.tensor([1 - len(matmul_output_axes)], dtype=torch.int64)
+                )
             shape_tensors.append(matmul_output_numel_tensor)
             shape_tensors.append(g.op("Constant", value_t=torch.tensor([-1], dtype=torch.int64)))
         else:
-            if contraction_numel_tensor is None:    # contraction_axes can't be empty, None here means only one contraction axis.
+            if (
+                contraction_numel_tensor is None
+            ):  # contraction_axes can't be empty, None here means only one contraction axis.
                 contraction_numel_tensor = g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64))
             shape_tensors.append(contraction_numel_tensor)
             shape_tensors.append(g.op("Constant", value_t=torch.tensor([-1], dtype=torch.int64)))
         new_tensor = reshape_tensor(g, new_tensor, shape_tensors)
     return new_tensor, shape_tensor
 
-@register_symbolic('einsum')
-@parse_args('s', 'v')
-def einsum(g, equation, tensor_list):
+
+@register_symbolic("einsum", torch_version_end="1.13.0")
+@parse_args("s", "v")
+def einsum_pre_troch_113(g, equation, tensor_list):
+    return einsum_internal(g, equation, tensor_list)
+
+
+@register_symbolic("einsum", torch_version_start="1.13.0")
+@parse_args("s", "v", "is")
+def einsum_torch_113(g, equation, tensor_list, path=None):
+    return einsum_internal(g, equation, tensor_list)
+
+
+def einsum_internal(g, equation, tensor_list):
     tensors = sym_help._unpack_list(tensor_list)
     num_ops = len(tensors)
     assert num_ops > 0
 
     # Doesn't support implicit output is ellipsis or more than 2 oprands for now.
     # Doesn't support ellipsis ('...') for now as not easy to get sizes of oprands.
-    if num_ops != 2 or equation.find('->') == -1 or '.' in equation:
+    if num_ops != 2 or equation.find("->") == -1 or "." in equation:
         return g.op("Einsum", *tensors, equation_s=equation)
 
     # Take "ks,ksm->sm" as example. After prcoess inputs,
@@ -397,8 +610,12 @@ def einsum(g, equation, tensor_list):
     # i.e., a.unsqueeze([2]).permute([1,2,0]).permute([0,1,2]) = [s,1,k] for the example.
     # For rhs input, the new permute is batched_axes + contraction_axes + matmul_output_axes: [0, 2, 1].
     # i.e., b.unsqueeze([]).permute([1,2,0]).permute([0,2,1]) = [s,k,m] for the example.
-    lhs_perm = combine_unsqueeze_and_permute_for_matmul(lhs_unsqueeze_axes, lhs_perm, batched_axes + matmul_output_axes + contraction_axes)
-    rhs_perm = combine_unsqueeze_and_permute_for_matmul(rhs_unsqueeze_axes, rhs_perm, batched_axes + contraction_axes + matmul_output_axes)
+    lhs_perm = combine_unsqueeze_and_permute_for_matmul(
+        lhs_unsqueeze_axes, lhs_perm, batched_axes + matmul_output_axes + contraction_axes
+    )
+    rhs_perm = combine_unsqueeze_and_permute_for_matmul(
+        rhs_unsqueeze_axes, rhs_perm, batched_axes + contraction_axes + matmul_output_axes
+    )
 
     # Need to Reshape two input tensors before the BatchedMatMul and Reshape result to output shape.
     # Reshape lhs input to [[batched_shapes], Mul(lhs_matmul_output_shapes), Mul(contraction_shapes)].
@@ -407,8 +624,12 @@ def einsum(g, equation, tensor_list):
     # lhs_contraction_axes = [0], rhs_contraction_axes = [0], lhs_matmul_output_axes = [], rhs_matmul_output_axes = [2] for the example.
     lhs_contraction_axes = [lhs_labels.index(label) for label in contraction_labels]
     rhs_contraction_axes = [rhs_labels.index(label) for label in contraction_labels]
-    lhs_matmul_output_axes = [lhs_labels.index(result_labels[axis]) for axis in matmul_output_axes if result_labels[axis] in lhs_labels]
-    rhs_matmul_output_axes = [rhs_labels.index(result_labels[axis]) for axis in matmul_output_axes if result_labels[axis] in rhs_labels]
+    lhs_matmul_output_axes = [
+        lhs_labels.index(result_labels[axis]) for axis in matmul_output_axes if result_labels[axis] in lhs_labels
+    ]
+    rhs_matmul_output_axes = [
+        rhs_labels.index(result_labels[axis]) for axis in matmul_output_axes if result_labels[axis] in rhs_labels
+    ]
 
     # Caches of input shape tensors to avoid generating duplicated graph.
     lhs_shape_tensor = None
@@ -418,7 +639,8 @@ def einsum(g, equation, tensor_list):
     contraction_numel_tensor = None
     if len(lhs_contraction_axes) > 1:
         _, contraction_numel_tensor, lhs_shape_tensor = get_shape_tensor_by_axes(
-            g, lhs_tensor, lhs_shape_tensor, lhs_contraction_axes, True)
+            g, lhs_tensor, lhs_shape_tensor, lhs_contraction_axes, True
+        )
 
     # Prepare some shape tensors for Reshape if needed.
     # Both lhs_matmul_output_shape_tensor and lhs_matmul_output_numel_tensor is None for the example.
@@ -426,22 +648,34 @@ def einsum(g, equation, tensor_list):
     lhs_matmul_output_numel_tensor = None
     if len(lhs_matmul_output_axes) > 1:
         lhs_matmul_output_shape_tensor, lhs_matmul_output_numel_tensor, lhs_shape_tensor = get_shape_tensor_by_axes(
-            g, lhs_tensor, lhs_shape_tensor, lhs_matmul_output_axes, True)
+            g, lhs_tensor, lhs_shape_tensor, lhs_matmul_output_axes, True
+        )
 
     # Both rhs_matmul_output_shape_tensor and rhs_matmul_output_numel_tensor is None for the example.
     rhs_matmul_output_shape_tensor = None
     rhs_matmul_output_numel_tensor = None
     if len(rhs_matmul_output_axes) > 1:
         rhs_matmul_output_shape_tensor, rhs_matmul_output_numel_tensor, rhs_shape_tensor = get_shape_tensor_by_axes(
-            g, rhs_tensor, rhs_shape_tensor, rhs_matmul_output_axes, True)
+            g, rhs_tensor, rhs_shape_tensor, rhs_matmul_output_axes, True
+        )
 
     new_lhs_tensor = lhs_tensor
     # Need to Reshape lhs_tensor if lhs_matmul_output_axes or lhs_contraction_axes is not 1, otherwise permute it directly.
     # Need to Reshape the lhs_tensor for the example, the new shape is [size(s), 1, size(k)].
     if len(lhs_matmul_output_axes) != 1 or len(lhs_contraction_axes) != 1:
         new_lhs_tensor, lhs_shape_tensor = permute_and_reshape_tensor(
-            g, lhs_tensor, True, len(lhs_labels), lhs_perm, lhs_matmul_output_axes, lhs_contraction_axes,
-            len(batched_axes), lhs_matmul_output_numel_tensor, contraction_numel_tensor, lhs_shape_tensor)
+            g,
+            lhs_tensor,
+            True,
+            len(lhs_labels),
+            lhs_perm,
+            lhs_matmul_output_axes,
+            lhs_contraction_axes,
+            len(batched_axes),
+            lhs_matmul_output_numel_tensor,
+            contraction_numel_tensor,
+            lhs_shape_tensor,
+        )
     else:
         if need_permute(lhs_perm):
             new_lhs_tensor = g.op("Transpose", lhs_tensor, perm_i=lhs_perm)
@@ -451,8 +685,18 @@ def einsum(g, equation, tensor_list):
     new_rhs_tensor = rhs_tensor
     if len(rhs_matmul_output_axes) != 1 or len(rhs_contraction_axes) != 1:
         new_rhs_tensor, rhs_shape_tensor = permute_and_reshape_tensor(
-            g, rhs_tensor, False, len(rhs_labels), rhs_perm, rhs_matmul_output_axes, rhs_contraction_axes,
-            len(batched_axes), rhs_matmul_output_numel_tensor, contraction_numel_tensor, rhs_shape_tensor)
+            g,
+            rhs_tensor,
+            False,
+            len(rhs_labels),
+            rhs_perm,
+            rhs_matmul_output_axes,
+            rhs_contraction_axes,
+            len(batched_axes),
+            rhs_matmul_output_numel_tensor,
+            contraction_numel_tensor,
+            rhs_shape_tensor,
+        )
     else:
         if need_permute(rhs_perm):
             new_rhs_tensor = g.op("Transpose", rhs_tensor, perm_i=rhs_perm)
@@ -484,8 +728,11 @@ def einsum(g, equation, tensor_list):
 
     # Now output axes is ordered by [batched_axes, lhs_matmul_output_axes, rhs_matmut_output_axes],
     # if this is not same as output, need one permute.
-    labels = [result_labels[axis] for axis in batched_axes] + [
-        lhs_labels[axis] for axis in lhs_matmul_output_axes] + [rhs_labels[axis] for axis in rhs_matmul_output_axes]
+    labels = (
+        [result_labels[axis] for axis in batched_axes]
+        + [lhs_labels[axis] for axis in lhs_matmul_output_axes]
+        + [rhs_labels[axis] for axis in rhs_matmul_output_axes]
+    )
     assert len(labels) == out_size
     output_perm = [labels.index(label) for label in result_labels]
     assert all(axis in output_perm for axis in range(out_size))
@@ -493,4 +740,62 @@ def einsum(g, equation, tensor_list):
         result = g.op("Transpose", result, perm_i=output_perm)
 
     return result
+
+
 # End of torch.einsum.
+
+
+@register_symbolic("group_norm")
+def group_norm(g, input, num_groups, weight, bias, eps, cudnn_enabled):
+    # Torch's group_norm's weight and bias are optional, its gradient has a bool[3] augment to indicate
+    # whether to compute the gradient for input, weight, bias. For simplicity of the gradient graph builder,
+    # we support only the case that weight and bias are not None.
+    from torch.onnx.symbolic_opset9 import group_norm as group_norm_generic
+
+    if weight is None or sym_help._is_none(weight) or bias is None or sym_help._is_none(bias):
+        return group_norm_generic(g, input, num_groups, weight, bias, eps, cudnn_enabled)
+
+    shape = g.op("Shape", input)
+    size = g.op("Size", input)
+    N = g.op("Gather", shape, g.op("Constant", value_t=torch.tensor(0, dtype=torch.long)), axis_i=0)
+    C = g.op("Gather", shape, g.op("Constant", value_t=torch.tensor(1, dtype=torch.long)), axis_i=0)
+    HxW = g.op("Div", size, g.op("Mul", N, C))
+    return g.op(
+        "org.pytorch.aten::ATen",
+        input,
+        weight,
+        bias,
+        N,
+        C,
+        HxW,
+        num_groups,
+        g.op("Cast", eps, to_i=1),  # Python's float is float64.
+        operator_s="native_group_norm",
+        outputs=3,
+    )[0]
+
+
+def _upsample_nearest(g, input, output_size, scale_factors, forward_fn):
+    return g.op(
+        "org.pytorch.aten::ATen",
+        input,
+        output_size,
+        scale_factors,
+        operator_s=forward_fn,
+        overload_name_s="vec",
+    )
+
+
+@register_symbolic("upsample_nearest1d")
+def upsample_nearest1d(g, input, output_size, scale_factors):
+    return _upsample_nearest(g, input, output_size, scale_factors, "upsample_nearest1d")
+
+
+@register_symbolic("upsample_nearest2d")
+def upsample_nearest2d(g, input, output_size, scale_factors):
+    return _upsample_nearest(g, input, output_size, scale_factors, "upsample_nearest2d")
+
+
+@register_symbolic("upsample_nearest3d")
+def upsample_nearest3d(g, input, output_size, scale_factors):
+    return _upsample_nearest(g, input, output_size, scale_factors, "upsample_nearest3d")

@@ -1,9 +1,11 @@
 // Copyright (c Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include "qlinear_util.h"
 #include "qlinear_concat.h"
 #include "qlinear_lookup_table.h"
 
+#include "core/common/narrow.h"
 #include "core/providers/common.h"
 #include "core/mlas/inc/mlas.h"
 #include "core/platform/threadpool.h"
@@ -11,29 +13,11 @@
 namespace onnxruntime {
 namespace contrib {
 
-constexpr int LOOKUP_TABLE_IS_FIXED = 1;
-constexpr int LOOKUP_TABLE_IS_COPY = 2;
-
-static inline bool has_same_scale(const Tensor* tensor_x_scale, const Tensor* tensor_y_scale) {
-  return *(tensor_x_scale->Data<float>()) == *(tensor_y_scale->Data<float>());
-}
-
-static inline bool has_same_zero_point(bool is_signed, const Tensor* tensor_x_zero_point, const Tensor* tensor_y_zero_point) {
-  if (is_signed) {
-    const int8_t X_zero_point = (tensor_x_zero_point == nullptr) ? static_cast<int8_t>(0) : *(tensor_x_zero_point->template Data<int8_t>());
-    const int8_t Y_zero_point = (tensor_y_zero_point == nullptr) ? static_cast<int8_t>(0) : *(tensor_y_zero_point->template Data<int8_t>());
-    return X_zero_point == Y_zero_point;
-  } else {
-    const uint8_t X_zero_point = (tensor_x_zero_point == nullptr) ? static_cast<uint8_t>(0) : *(tensor_x_zero_point->template Data<uint8_t>());
-    const uint8_t Y_zero_point = (tensor_y_zero_point == nullptr) ? static_cast<uint8_t>(0) : *(tensor_y_zero_point->template Data<uint8_t>());
-    return X_zero_point == Y_zero_point;
-  }
-}
 
 QLinearConcat::QLinearConcat(const OpKernelInfo& info) : OpKernel(info), ConcatBase(info) {
   size_t input_def_count = info.node().InputDefs().size();
-  ORT_ENFORCE(input_def_count >= 8 && (input_def_count - 2) % 3 == 0,
-              "At least two inputs are needed, and each input must be (tensor, scale, zero_point) tuple!");
+  ORT_ENFORCE(input_def_count >= 5 && (input_def_count - 2) % 3 == 0,
+              "Each input must be (tensor, scale, zero_point) tuple!");
 
   size_t input_count = (input_def_count - 2) / 3;
   fixed_lookup_tables_.resize(input_count);
@@ -90,8 +74,8 @@ Status QLinearConcat::Compute(OpKernelContext* ctx) const {
 
   // Number of input tensors to concatenate (tupled)
   auto input_count_x3 = Node().InputArgCount()[2];
-  ORT_ENFORCE(input_count_x3 >= 6 && input_count_x3 % 3 == 0,
-              "At least two inputs are needed, and each input must be (tensor, scale, zero_point) tuple!");
+  ORT_ENFORCE(input_count_x3 >= 3 && input_count_x3 % 3 == 0,
+              "Each input must be (tensor, scale, zero_point) tuple!");
 
   // Hold pointers to the input tensors to be used in the PrepareForCompute() step
   auto input_count = input_count_x3 / 3;
@@ -158,9 +142,9 @@ Status QLinearConcat::Compute(OpKernelContext* ctx) const {
     uint8_t* output = static_cast<uint8_t*>(p.output_tensor->MutableDataRaw()) + initial_output_offset;
     for (int64_t cur_in_offset = 0; cur_in_offset < prep.num_elements; cur_in_offset += input_axis_pitch) {
       if (is_copy) {
-        memcpy(output, input + cur_in_offset, input_axis_pitch);
+        memcpy(output, input + cur_in_offset, narrow<size_t>(input_axis_pitch));
       } else {
-        QLinearLookupTableTransform(input + cur_in_offset, table, output, input_axis_pitch);
+        QLinearLookupTableTransform(input + cur_in_offset, table, output, narrow<size_t>(input_axis_pitch));
       }
       output += p.output_axis_pitch;
     }

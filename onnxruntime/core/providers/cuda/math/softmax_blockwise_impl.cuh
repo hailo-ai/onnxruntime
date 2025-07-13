@@ -41,7 +41,7 @@ dim3 SoftMax_getBlockSize(int ILP, uint64_t dim_size) {
 
   while (block_size < (max_block_size)) block_size *= 2;
   // Launch at least a single warp - the kernel assumes that.
-  block_size = std::max(block_size, static_cast<uint64_t>(GPU_WARP_SIZE));
+  block_size = std::max(block_size, static_cast<uint64_t>(GPU_WARP_SIZE_HOST));
   return dim3(static_cast<unsigned int>(block_size));
 }
 
@@ -267,8 +267,7 @@ WriteFpropResults(
 template <int ILP, typename scalar_t, typename accscalar_t, typename outscalar_t,
   template <typename, typename, typename> class Epilogue>
 __global__ void
-softmax_block_forward(outscalar_t *output, scalar_t *input, int classes)
-{
+softmax_block_forward(outscalar_t* output, scalar_t* input, int classes, int input_stride, int output_stride) {
   extern __shared__ unsigned char smem[];
   auto sdata = reinterpret_cast<accscalar_t*>(smem);
 
@@ -277,8 +276,8 @@ softmax_block_forward(outscalar_t *output, scalar_t *input, int classes)
 
   // forward pointers to batch[blockIdx.x]
   // each block handles a sample in the mini-batch
-  input += blockIdx.x * classes;
-  output += blockIdx.x * classes;
+  input += blockIdx.x * input_stride;
+  output += blockIdx.x * output_stride;
 
   const int shift = ((uint64_t)input) % ALIGN_BYTES / sizeof(scalar_t);
   const int output_shift = ((uint64_t)output) % ALIGN_BYTES / sizeof(outscalar_t);

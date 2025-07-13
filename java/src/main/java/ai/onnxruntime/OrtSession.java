@@ -1,12 +1,14 @@
 /*
- * Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2022, Oracle and/or its affiliates. All rights reserved.
  * Licensed under the MIT License.
  */
 package ai.onnxruntime;
 
 import ai.onnxruntime.providers.CoreMLFlags;
 import ai.onnxruntime.providers.NNAPIFlags;
+import ai.onnxruntime.providers.OrtCUDAProviderOptions;
 import ai.onnxruntime.providers.OrtFlags;
+import ai.onnxruntime.providers.OrtTensorRTProviderOptions;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -201,7 +203,7 @@ public class OrtSession implements AutoCloseable {
    * @throws OrtException If there was an error in native code, the input names are invalid, or if
    *     there are zero or too many inputs.
    */
-  public Result run(Map<String, OnnxTensor> inputs) throws OrtException {
+  public Result run(Map<String, ? extends OnnxTensorLike> inputs) throws OrtException {
     return run(inputs, outputNames);
   }
 
@@ -216,7 +218,8 @@ public class OrtSession implements AutoCloseable {
    * @throws OrtException If there was an error in native code, the input names are invalid, or if
    *     there are zero or too many inputs.
    */
-  public Result run(Map<String, OnnxTensor> inputs, RunOptions runOptions) throws OrtException {
+  public Result run(Map<String, ? extends OnnxTensorLike> inputs, RunOptions runOptions)
+      throws OrtException {
     return run(inputs, outputNames, runOptions);
   }
 
@@ -231,7 +234,7 @@ public class OrtSession implements AutoCloseable {
    * @throws OrtException If there was an error in native code, the input or output names are
    *     invalid, or if there are zero or too many inputs or outputs.
    */
-  public Result run(Map<String, OnnxTensor> inputs, Set<String> requestedOutputs)
+  public Result run(Map<String, ? extends OnnxTensorLike> inputs, Set<String> requestedOutputs)
       throws OrtException {
     return run(inputs, requestedOutputs, null);
   }
@@ -239,7 +242,7 @@ public class OrtSession implements AutoCloseable {
   /**
    * Scores an input feed dict, returning the map of requested inferred outputs.
    *
-   * <p>The outputs are sorted based on the supplied set traveral order.
+   * <p>The outputs are sorted based on the supplied set traversal order.
    *
    * @param inputs The inputs to score.
    * @param requestedOutputs The requested outputs.
@@ -249,10 +252,12 @@ public class OrtSession implements AutoCloseable {
    *     invalid, or if there are zero or too many inputs or outputs.
    */
   public Result run(
-      Map<String, OnnxTensor> inputs, Set<String> requestedOutputs, RunOptions runOptions)
+      Map<String, ? extends OnnxTensorLike> inputs,
+      Set<String> requestedOutputs,
+      RunOptions runOptions)
       throws OrtException {
     if (!closed) {
-      if (inputs.isEmpty() || (inputs.size() > numInputs)) {
+      if ((inputs.isEmpty() && (numInputs != 0)) || (inputs.size() > numInputs)) {
         throw new OrtException(
             "Unexpected number of inputs, expected [1," + numInputs + ") found " + inputs.size());
       }
@@ -266,7 +271,7 @@ public class OrtSession implements AutoCloseable {
       String[] inputNamesArray = new String[inputs.size()];
       long[] inputHandles = new long[inputs.size()];
       int i = 0;
-      for (Map.Entry<String, OnnxTensor> t : inputs.entrySet()) {
+      for (Map.Entry<String, ? extends OnnxTensorLike> t : inputs.entrySet()) {
         if (inputNames.contains(t.getKey())) {
           inputNamesArray[i] = t.getKey();
           inputHandles[i] = t.getValue().getNativeHandle();
@@ -369,7 +374,7 @@ public class OrtSession implements AutoCloseable {
    * @return A Map from String to NodeInfo.
    */
   private static Map<String, NodeInfo> wrapInMap(NodeInfo[] infos) {
-    Map<String, NodeInfo> output = new LinkedHashMap<>();
+    Map<String, NodeInfo> output = new LinkedHashMap<>(OrtUtil.capacityFromSize(infos.length));
 
     for (NodeInfo info : infos) {
       output.put(info.getName(), info);
@@ -697,6 +702,28 @@ public class OrtSession implements AutoCloseable {
     }
 
     /**
+     * Registers custom ops for use with {@link OrtSession}s using this SessionOptions by calling
+     * the specified native function name. The custom ops library must either be linked against, or
+     * have previously been loaded by the user.
+     *
+     * <p>The registration function must have the signature:
+     *
+     * <p>&emsp;OrtStatus* (*fn)(OrtSessionOptions* options, const OrtApiBase* api);
+     *
+     * <p>See https://onnxruntime.ai/docs/reference/operators/add-custom-op.html for more
+     * information on custom ops. See
+     * https://github.com/microsoft/onnxruntime/blob/342a5bf2b756d1a1fc6fdc582cfeac15182632fe/onnxruntime/test/testdata/custom_op_library/custom_op_library.cc#L115
+     * for an example of a custom op library registration function.
+     *
+     * @param registrationFuncName The name of the registration function to call.
+     * @throws OrtException If there was an error finding or calling the registration function.
+     */
+    public void registerCustomOpsUsingFunction(String registrationFuncName) throws OrtException {
+      checkClosed();
+      registerCustomOpsUsingFunction(OnnxRuntime.ortApiHandle, nativeHandle, registrationFuncName);
+    }
+
+    /**
      * Sets the value of a symbolic dimension. Fixed dimension computations may have more
      * optimizations applied to them.
      *
@@ -764,6 +791,22 @@ public class OrtSession implements AutoCloseable {
       checkClosed();
       if (OnnxRuntime.extractCUDA()) {
         addCUDA(OnnxRuntime.ortApiHandle, nativeHandle, deviceNum);
+      } else {
+        throw new OrtException(
+            OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find CUDA shared provider");
+      }
+    }
+
+    /**
+     * Adds CUDA as an execution backend, using the specified CUDA options.
+     *
+     * @param cudaOpts The CUDA execution provider options.
+     * @throws OrtException If there was an error in the native code.
+     */
+    public void addCUDA(OrtCUDAProviderOptions cudaOpts) throws OrtException {
+      checkClosed();
+      if (OnnxRuntime.extractCUDA()) {
+        addCUDAV2(OnnxRuntime.ortApiHandle, nativeHandle, cudaOpts.nativeHandle);
       } else {
         throw new OrtException(
             OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find CUDA shared provider");
@@ -858,6 +901,22 @@ public class OrtSession implements AutoCloseable {
     }
 
     /**
+     * Adds Nvidia's TensorRT as an execution backend.
+     *
+     * @param tensorRTOpts The configuration parameters for TensorRT.
+     * @throws OrtException If there was an error in native code.
+     */
+    public void addTensorrt(OrtTensorRTProviderOptions tensorRTOpts) throws OrtException {
+      checkClosed();
+      if (OnnxRuntime.extractTensorRT()) {
+        addTensorrtV2(OnnxRuntime.ortApiHandle, nativeHandle, tensorRTOpts.nativeHandle);
+      } else {
+        throw new OrtException(
+            OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find TensorRT shared provider");
+      }
+    }
+
+    /**
      * Adds Android's NNAPI as an execution backend. Uses the default empty flag.
      *
      * @throws OrtException If there was an error in native code.
@@ -875,18 +934,6 @@ public class OrtSession implements AutoCloseable {
     public void addNnapi(EnumSet<NNAPIFlags> flags) throws OrtException {
       checkClosed();
       addNnapi(OnnxRuntime.ortApiHandle, nativeHandle, OrtFlags.aggregateToInt(flags));
-    }
-
-    /**
-     * Adds Nuphar as an execution backend.
-     *
-     * @param allowUnalignedBuffers Allow unaligned memory buffers.
-     * @param settings See the documentation for valid settings strings.
-     * @throws OrtException If there was an error in native code.
-     */
-    public void addNuphar(boolean allowUnalignedBuffers, String settings) throws OrtException {
-      checkClosed();
-      addNuphar(OnnxRuntime.ortApiHandle, nativeHandle, allowUnalignedBuffers ? 1 : 0, settings);
     }
 
     /**
@@ -953,6 +1000,27 @@ public class OrtSession implements AutoCloseable {
       addCoreML(OnnxRuntime.ortApiHandle, nativeHandle, OrtFlags.aggregateToInt(flags));
     }
 
+    /**
+     * Adds Xnnpack as an execution backend. Needs to list all options here if a new option
+     * supported. current supported options: {}
+     *
+     * @param providerOptions options pass to XNNPACK EP for initialization.
+     * @throws OrtException If there was an error in native code.
+     */
+    public void addXnnpack(Map<String, String> providerOptions) throws OrtException {
+      checkClosed();
+      String[] providerOptionKey = new String[providerOptions.size()];
+      String[] providerOptionVal = new String[providerOptions.size()];
+      int i = 0;
+      for (Map.Entry<String, String> entry : providerOptions.entrySet()) {
+        providerOptionKey[i] = entry.getKey();
+        providerOptionVal[i] = entry.getValue();
+        i++;
+      }
+      addExecutionProvider(
+          OnnxRuntime.ortApiHandle, nativeHandle, "XNNPACK", providerOptionKey, providerOptionVal);
+    }
+
     private native void setExecutionMode(long apiHandle, long nativeHandle, int mode)
         throws OrtException;
 
@@ -993,6 +1061,9 @@ public class OrtSession implements AutoCloseable {
     private native long registerCustomOpLibrary(long apiHandle, long nativeHandle, String path)
         throws OrtException;
 
+    private native void registerCustomOpsUsingFunction(
+        long apiHandle, long nativeHandle, String registrationFuncName) throws OrtException;
+
     private native void closeCustomLibraries(long[] nativeHandle);
 
     private native void closeOptions(long apiHandle, long nativeHandle);
@@ -1026,6 +1097,9 @@ public class OrtSession implements AutoCloseable {
     private native void addCUDA(long apiHandle, long nativeHandle, int deviceNum)
         throws OrtException;
 
+    private native void addCUDAV2(long apiHandle, long nativeHandle, long cudaOptsHandle)
+        throws OrtException;
+
     private native void addROCM(long apiHandle, long nativeHandle, int deviceNum)
         throws OrtException;
 
@@ -1038,11 +1112,10 @@ public class OrtSession implements AutoCloseable {
     private native void addTensorrt(long apiHandle, long nativeHandle, int deviceNum)
         throws OrtException;
 
-    private native void addNnapi(long apiHandle, long nativeHandle, int nnapiFlags)
+    private native void addTensorrtV2(long apiHandle, long nativeHandle, long tensorrtOptsHandle)
         throws OrtException;
 
-    private native void addNuphar(
-        long apiHandle, long nativeHandle, int allowUnalignedBuffers, String settings)
+    private native void addNnapi(long apiHandle, long nativeHandle, int nnapiFlags)
         throws OrtException;
 
     private native void addTvm(long apiHandle, long nativeHandle, String settings)
@@ -1057,6 +1130,14 @@ public class OrtSession implements AutoCloseable {
         throws OrtException;
 
     private native void addCoreML(long apiHandle, long nativeHandle, int coreMLFlags)
+        throws OrtException;
+
+    private native void addExecutionProvider(
+        long apiHandle,
+        long nativeHandle,
+        String epName,
+        String[] providerOptionKey,
+        String[] providerOptionVal)
         throws OrtException;
   }
 
@@ -1219,9 +1300,6 @@ public class OrtSession implements AutoCloseable {
      * @param values The output values.
      */
     Result(String[] names, OnnxValue[] values) {
-      map = new LinkedHashMap<>();
-      list = new ArrayList<>();
-
       if (names.length != values.length) {
         throw new IllegalArgumentException(
             "Expected same number of names and values, found names.length = "
@@ -1229,6 +1307,9 @@ public class OrtSession implements AutoCloseable {
                 + ", values.length = "
                 + values.length);
       }
+
+      map = new LinkedHashMap<>(OrtUtil.capacityFromSize(names.length));
+      list = new ArrayList<>(names.length);
 
       for (int i = 0; i < names.length; i++) {
         map.put(names[i], values[i]);

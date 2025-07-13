@@ -52,8 +52,14 @@ static const OpVersionsAndSelector::OpVersionsMap GetVariadicOpVersionsMap() {
 static const OpVersionsAndSelector::OpVersionsMap GetConvOpVersionsMap() {
   return {{"Conv", {}}};
 }
+static const OpVersionsAndSelector::OpVersionsMap GetConvTransposeOpVersionsMap() {
+  return {{"ConvTranspose", {}}};
+}
 static const OpVersionsAndSelector::OpVersionsMap GetMatMulOpVersionsMap() {
   return {{"MatMul", {}}};
+}
+static const OpVersionsAndSelector::OpVersionsMap GetGemmOpVersionsMap() {
+  return {{"Gemm", {}}};
 }
 
 /* Selector rules registration related */
@@ -92,10 +98,25 @@ void RegisterConvSelector(Selectors& qdq_selectors) {
                                  std::move(selector));
 }
 
+void RegisterConvTransposeSelector(Selectors& qdq_selectors) {
+  // register selector for ConvTranspose op
+  // it shares selector with Conv op, they have the same input/output def.
+  std::unique_ptr<NodeGroupSelector> selector = std::make_unique<ConvNodeGroupSelector>();
+  qdq_selectors.RegisterSelector(GetConvTransposeOpVersionsMap(),
+                                 std::move(selector));
+}
+
 void RegisterMatMulSelector(Selectors& qdq_selectors) {
   /* register selector for matmul op */
   std::unique_ptr<NodeGroupSelector> selector = std::make_unique<MatMulNodeGroupSelector>();
   qdq_selectors.RegisterSelector(GetMatMulOpVersionsMap(),
+                                 std::move(selector));
+}
+
+void RegisterGemmSelector(Selectors& qdq_selectors) {
+  /* register selector for gemm op */
+  std::unique_ptr<NodeGroupSelector> selector = std::make_unique<GemmNodeGroupSelector>();
+  qdq_selectors.RegisterSelector(GetGemmOpVersionsMap(),
                                  std::move(selector));
 }
 
@@ -105,7 +126,9 @@ void SelectorManager::CreateSelectors() {
   RegisterBinarySelectors(qdq_selectors_);
   RegisterVariadicSelectors(qdq_selectors_);
   RegisterConvSelector(qdq_selectors_);
+  RegisterConvTransposeSelector(qdq_selectors_);
   RegisterMatMulSelector(qdq_selectors_);
+  RegisterGemmSelector(qdq_selectors_);
 }
 
 void SelectorManager::InitializeSelectorsMap() {

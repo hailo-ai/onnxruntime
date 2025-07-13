@@ -12,16 +12,19 @@
 #include "onnx/onnx-operators_pb.h"
 
 #include "core/common/inlined_containers.h"
+#include "core/common/span_utils.h"
 #include "core/graph/graph.h"
 
 namespace onnxruntime {
 namespace graph_utils {
 
-/** Checks if the operator's type, version, and domain of the given node match the given values. */
+/** Checks if the operator's type, version, and domain of the given node match the given values.
+ * @remarks Use kOnnxDomain and not kOnnxDomainAlias for ONNX operators.
+ */
 bool IsSupportedOptypeVersionAndDomain(const Node& node,
                                        std::string_view op_type,
                                        std::initializer_list<ONNX_NAMESPACE::OperatorSetVersion> versions,
-                                       std::string_view domain = kOnnxDomainAlias);
+                                       std::string_view domain = kOnnxDomain);
 
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
 
@@ -53,6 +56,11 @@ const std::string& GetNodeInputName(const Node& node, int index);
 
 /** Gets the name of the outgoing NodeArg with the specified index for the given node. */
 const std::string& GetNodeOutputName(const Node& node, int index);
+
+/** Find the input edge of a node for a specified input index.
+@returns nullptr when not found.
+*/
+const Node::EdgeEnd* GetInputEdge(const Node& node, int arg_index);
 
 /** Removes all output edges from the given Node of the Graph.
     This should probably be elevated to the Graph API eventually. */
@@ -155,7 +163,7 @@ template <>
 inline InlinedVector<float> RetrieveValues(const ONNX_NAMESPACE::AttributeProto& attr) {
   return {attr.floats().begin(), attr.floats().end()};
 }
-}
+}  // namespace onnx_repeated_values
 
 /** Retrieves the values for a repeated attribute of a node and place them to the values vector. */
 template <typename T>
@@ -275,7 +283,7 @@ inline void FinalizeNodeFusion(Graph& graph,
                                std::initializer_list<std::reference_wrapper<Node>> nodes,
                                Node& replacement_node_start,
                                Node& replacement_node_end) {
-  FinalizeNodeFusion(graph, gsl::make_span(nodes), replacement_node_start, replacement_node_end);
+  FinalizeNodeFusion(graph, AsSpan(nodes), replacement_node_start, replacement_node_end);
 }
 
 /** Finalize the fusion of two or more nodes which are being replaced with a single node.
@@ -293,13 +301,8 @@ inline void FinalizeNodeFusion(Graph& graph, gsl::span<const std::reference_wrap
 }
 
 inline void FinalizeNodeFusion(Graph& graph, std::initializer_list<std::reference_wrapper<Node>> nodes, Node& replacement_node) {
-  FinalizeNodeFusion(graph, gsl::make_span(nodes.begin(), nodes.end()), replacement_node, replacement_node);
+  FinalizeNodeFusion(graph, AsSpan(nodes), replacement_node, replacement_node);
 }
-
-/** Find the input edge of a node for a specified input index.
-@returns nullptr when not found.
-*/
-const Node::EdgeEnd* GetInputEdge(const Node& node, int arg_index);
 
 /** Find the source node of an input edge for a specified input index.
 @returns nullptr when not found.
@@ -351,28 +354,28 @@ struct EdgeEndToMatch {
 bool FindPath(const Node& node, bool is_input_edge, gsl::span<const EdgeEndToMatch> edges_to_match, std::vector<const Node::EdgeEnd*>& result, const logging::Logger& logger);
 
 inline bool FindPath(const Node& node, bool is_input_edge, std::initializer_list<EdgeEndToMatch> edges_to_match, std::vector<const Node::EdgeEnd*>& result, const logging::Logger& logger) {
-  return FindPath(node, is_input_edge, gsl::make_span(edges_to_match), result, logger);
+  return FindPath(node, is_input_edge, AsSpan(edges_to_match), result, logger);
 }
 
 /** Same as FindPath above, but return the references of matched Node
-*/
+ */
 bool FindPath(Graph& graph, const Node& node, bool is_input_edge, gsl::span<const EdgeEndToMatch> edges_to_match, std::vector<std::reference_wrapper<Node>>& result, const logging::Logger& logger);
 
 inline bool FindPath(Graph& graph, const Node& node, bool is_input_edge, std::initializer_list<EdgeEndToMatch> edges_to_match, std::vector<std::reference_wrapper<Node>>& result, const logging::Logger& logger) {
-  return FindPath(graph, node, is_input_edge, gsl::make_span(edges_to_match), result, logger);
+  return FindPath(graph, node, is_input_edge, AsSpan(edges_to_match), result, logger);
 }
 
 /**
  * Remove nodes with only one output edge using bottom-up bfs traversal.
  * @param node: The node to start with.
  * @returns true if there is one or more node(s) removed by this function. Otherwise return false.
-*/
+ */
 bool RemoveNodesWithOneOutputBottomUp(Graph& graph, const Node& node);
 
 /** Creates a mutable NodeArg owned by the graph with mirrored base_arg's TypeProto and name
  * @param base_arg The NodeArg the newly created NodeArg is mirrored based off.
  * @returns NodeArg reference that contains the same TypeProto info as base_arg with generated different names.
-*/
+ */
 NodeArg& CreateNodeArg(Graph& graph, const NodeArg& base_arg);
 
 #endif  // !defined(ORT_MINIMAL_BUILD)

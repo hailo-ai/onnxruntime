@@ -140,7 +140,7 @@ void addSparseTensorMethods(pybind11::module& m) {
 
                     TensorShape dense_shape(py_dense_shape);
                     auto values_type = GetNumpyArrayType(py_values);
-                    auto ml_type = NumpyToOnnxRuntimeTensorType(values_type);
+                    auto ml_type = NumpyTypeToOnnxRuntimeTensorType(values_type);
 
                     std::unique_ptr<PySparseTensor> result;
                     if (IsNumericNumpyType(values_type)) {
@@ -199,7 +199,7 @@ void addSparseTensorMethods(pybind11::module& m) {
 
             TensorShape dense_shape(py_dense_shape);
             auto values_type = GetNumpyArrayType(py_values);
-            auto ml_type = NumpyToOnnxRuntimeTensorType(values_type);
+            auto ml_type = NumpyTypeToOnnxRuntimeTensorType(values_type);
 
             std::unique_ptr<PySparseTensor> result;
             if (IsNumericNumpyType(values_type)) {
@@ -262,7 +262,7 @@ void addSparseTensorMethods(pybind11::module& m) {
             TensorShape values_shape = GetShape(py_values);
             TensorShape index_shape = GetShape(py_indices);
             auto values_type = GetNumpyArrayType(py_values);
-            auto ml_type = NumpyToOnnxRuntimeTensorType(values_type);
+            auto ml_type = NumpyTypeToOnnxRuntimeTensorType(values_type);
 
             std::unique_ptr<PySparseTensor> result;
             if (IsNumericNumpyType(values_type)) {
@@ -376,7 +376,7 @@ void addSparseTensorMethods(pybind11::module& m) {
         auto gpu_transfer = GetGPUDataTransfer();
         auto dest_tensor = std::make_unique<SparseTensor>(sparse_tensor.DataType(), sparse_tensor.DenseShape(),
                                                           std::move(cuda_allocator));
-        ORT_THROW_IF_ERROR(sparse_tensor.Copy(*gpu_transfer, *dest_tensor, 0));
+        ORT_THROW_IF_ERROR(sparse_tensor.Copy(*gpu_transfer, *dest_tensor));
         auto result = std::make_unique<PySparseTensor>(std::move(dest_tensor));
         return result;
 #else

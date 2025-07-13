@@ -28,7 +28,7 @@ void VerifyOutputs(const std::vector<OrtValue>& fetches, const std::vector<int64
   auto& rtensor = fetches.front().Get<Tensor>();
   TensorShape expected_shape(expected_dims);
   ASSERT_EQ(expected_shape, rtensor.Shape());
-  const std::vector<T> found(rtensor.template Data<T>(), rtensor.template Data<T>() + expected_values.size());
+  const std::vector<T> found(rtensor.Data<T>(), rtensor.Data<T>() + expected_values.size());
   ASSERT_EQ(expected_values, found);
 }
 
@@ -106,7 +106,7 @@ void RunWithOneSessionSingleThreadInference(std::string model_name, std::string 
   RunOptions run_options;
   run_options.run_tag = so.session_logid;
   InferenceSession session_object{so, GetEnvironment()};
-  auto allocator_manager = session_object.GetAllocatorManager();
+  onnxruntime::AllocatorManager allocator_manager;
   auto cuda_provider = DefaultCudaExecutionProvider();
   cuda_provider->RegisterAllocator(allocator_manager);
   auto cpu_allocator = cuda_provider->GetAllocator(0, OrtMemTypeCPU);
@@ -149,6 +149,8 @@ void RunWithOneSessionSingleThreadInference(std::string model_name, std::string 
       nullptr,
       0,
       nullptr,
+      0,
+      0,
       0};
 
     params.trt_engine_cache_enable = 1;
@@ -175,7 +177,7 @@ void RunWithOneSessionMultiThreadsInference(std::string model_name, std::string 
   RunOptions run_options;
   run_options.run_tag = so.session_logid;
   InferenceSession session_object{so, GetEnvironment()};
-  auto allocator_manager = session_object.GetAllocatorManager();
+  onnxruntime::AllocatorManager allocator_manager;
   auto cuda_provider = DefaultCudaExecutionProvider();
   cuda_provider->RegisterAllocator(allocator_manager);
   auto cpu_allocator = cuda_provider->GetAllocator(0, OrtMemTypeCPU);
@@ -218,6 +220,8 @@ void RunWithOneSessionMultiThreadsInference(std::string model_name, std::string 
       nullptr,
       0,
       nullptr,
+      0,
+      0,
       0};
 
     params.trt_engine_cache_enable = 1;
@@ -245,7 +249,7 @@ void RunWithOneSessionMultiThreadsInference(std::string model_name, std::string 
       th.join();
 }
 
-TEST(TensorrtExecutionProviderTest, MultiThreadsTestWithOneSessionSingleThreadInference) {
+TEST(TensorrtExecutionProviderTest, SessionCreationWithMultiThreadsAndInferenceWithMultiThreads) {
   std::vector<std::thread> threads;
   std::string model_name = "trt_execution_provider_multithreading_test.onnx";
   std::string graph_name = "multithreading_test";
@@ -262,7 +266,7 @@ TEST(TensorrtExecutionProviderTest, MultiThreadsTestWithOneSessionSingleThreadIn
     th.join();
 }
 
-TEST(TensorrtExecutionProviderTest, MultiThreadsTestWithOneSessionMultiThreadsInference) {
+TEST(TensorrtExecutionProviderTest, SessionCreationWithSingleThreadAndInferenceWithMultiThreads) {
   std::string model_name = "trt_execution_provider_multithreading_test.onnx";
   std::string graph_name = "multithreading_test";
   std::string sess_log_id = "TRTEPMultiThreadingTestWithOneSessionMultiThreads";
@@ -270,6 +274,45 @@ TEST(TensorrtExecutionProviderTest, MultiThreadsTestWithOneSessionMultiThreadsIn
 
   CreateBaseModel(model_name, graph_name, dims);
   RunWithOneSessionMultiThreadsInference(model_name, sess_log_id);
+}
+
+// Test loading same model in different way, when hash id is generated via model name/model content/env metadata
+TEST(TensorrtExecutionProviderTest, TRTModelIdGeneratorUsingModelHashing) {
+  auto model_path = ORT_TSTR("testdata/mnist.onnx");
+
+  std::shared_ptr<Model> model;
+  ASSERT_TRUE(Model::Load(model_path, model, nullptr, DefaultLoggingManager().DefaultLogger()).IsOK());
+
+  Graph& graph = model->MainGraph();
+  GraphViewer viewer(graph);
+
+  // get the hash for the model when loaded from file
+  HashValue model_hash = TRTGenerateId(viewer);
+  ASSERT_NE(model_hash, 0);
+
+  // now load the model from bytes and check the hash differs
+  std::ifstream model_file_stream(model_path, std::ios::in | std::ios::binary);
+
+  std::shared_ptr<Model> model2;
+  ONNX_NAMESPACE::ModelProto model_proto;
+  ASSERT_STATUS_OK(Model::Load(model_file_stream, &model_proto));
+  ASSERT_STATUS_OK(Model::Load(std::move(model_proto), PathString(), model2, nullptr,
+                               DefaultLoggingManager().DefaultLogger()));
+
+  // Test loading same model from file and byte steam. Hash values should be different
+  Graph& graph2 = model2->MainGraph();
+  GraphViewer viewer2(graph2);
+  HashValue model_hash2= TRTGenerateId(viewer2);
+  ASSERT_NE(model_hash, model_hash2);
+
+  // Test loading same model from different path, see if hash values are same as well
+  model_path = ORT_TSTR("testdata/TRTEP_test_model/mnist.onnx");
+  std::shared_ptr<Model> model3;
+  ASSERT_TRUE(Model::Load(model_path, model3, nullptr, DefaultLoggingManager().DefaultLogger()).IsOK());
+  Graph& graph3 = model3->MainGraph();
+  GraphViewer viewer3(graph3);
+  HashValue model_hash3 = TRTGenerateId(viewer3);
+  ASSERT_EQ(model_hash, model_hash3) << "model 1&3 are same models and they have same hash, no matter where they are loaded";
 }
 
 TEST_P(TensorrtExecutionProviderCacheTest, Run) {
@@ -297,7 +340,7 @@ TEST_P(TensorrtExecutionProviderCacheTest, Run) {
   RunOptions run_options;
   run_options.run_tag = so.session_logid;
   InferenceSession session_object{so, GetEnvironment()};
-  auto allocator_manager = session_object.GetAllocatorManager();
+  onnxruntime::AllocatorManager allocator_manager;
   auto cuda_provider = DefaultCudaExecutionProvider();
   cuda_provider->RegisterAllocator(allocator_manager);
   auto cpu_allocator = cuda_provider->GetAllocator(0, OrtMemTypeCPU);
@@ -341,6 +384,8 @@ TEST_P(TensorrtExecutionProviderCacheTest, Run) {
       nullptr,
       0,
       nullptr,
+      0,
+      0,
       0};
 
   if (cache_type.compare("engine") == 0) {
@@ -518,7 +563,7 @@ TEST(TensorrtExecutionProviderTest, FunctionTest) {
   run_options.run_tag = so.session_logid;
   InferenceSession session_object{so, GetEnvironment()};
 
-  auto allocator_manager = session_object.GetAllocatorManager();
+  onnxruntime::AllocatorManager allocator_manager;
   auto cuda_provider = DefaultCudaExecutionProvider();
   cuda_provider->RegisterAllocator(allocator_manager);
   auto cpu_allocator = cuda_provider->GetAllocator(0, OrtMemTypeCPU);
@@ -622,7 +667,7 @@ TEST(TensorrtExecutionProviderTest, NodeIndexMappingTest) {
   run_options.run_tag = so.session_logid;
   InferenceSession session_object{so, GetEnvironment()};
 
-  auto allocator_manager = session_object.GetAllocatorManager();
+  onnxruntime::AllocatorManager allocator_manager;
   auto cuda_provider = DefaultCudaExecutionProvider();
   cuda_provider->RegisterAllocator(allocator_manager);
   auto cpu_allocator = cuda_provider->GetAllocator(0, OrtMemTypeCPU);
@@ -743,7 +788,7 @@ TEST(TensorrtExecutionProviderTest, RemoveCycleTest) {
   run_options.run_tag = so.session_logid;
   InferenceSession session_object{so, GetEnvironment()};
 
-  auto allocator_manager = session_object.GetAllocatorManager();
+  onnxruntime::AllocatorManager allocator_manager;
   auto cuda_provider = DefaultCudaExecutionProvider();
   cuda_provider->RegisterAllocator(allocator_manager);
   auto cpu_allocator = cuda_provider->GetAllocator(0, OrtMemTypeCPU);

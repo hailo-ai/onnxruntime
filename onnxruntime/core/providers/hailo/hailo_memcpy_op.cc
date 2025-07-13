@@ -16,13 +16,13 @@ Status HailoMemcpy::Compute(OpKernelContext* ctx) const {
     if (input_type_0->IsTensorType()) {
         const auto* X = ctx->Input<Tensor>(0);
         Tensor* Y = ctx->Output(0, X->Shape());
-        retval = Info().GetDataTransferManager().CopyTensor(*X, *Y, Info().GetKernelDef().ExecQueueId());
+        retval = Info().GetDataTransferManager().CopyTensor(*X, *Y);
     }
 #if !defined(DISABLE_SPARSE_TENSORS)
     else if (input_type_0->IsSparseTensorType()) {
         const auto* X = ctx->Input<SparseTensor>(0);
         SparseTensor* Y = ctx->OutputSparse(0, X->DenseShape());
-        retval = X->Copy(Info().GetDataTransferManager(), Info().GetKernelDef().ExecQueueId(), *Y);
+        retval = X->Copy(Info().GetDataTransferManager(), *Y);
     }
 #endif
     else {

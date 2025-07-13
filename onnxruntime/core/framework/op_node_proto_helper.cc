@@ -6,7 +6,7 @@
 #include "core/framework/tensorprotoutils.h"
 #include "core/graph/onnx_protobuf.h"
 #include "core/graph/op.h"
-#include "gsl/gsl"
+#include "core/common/gsl.h"
 
 using namespace ONNX_NAMESPACE;
 using namespace ::onnxruntime::common;
@@ -83,7 +83,7 @@ inline constexpr int ArrayTypeToAttributeType<std::string>() {
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "No attribute with name:'", name, "'is defined."); \
     }                                                                                              \
     if (!HasTyped<T>(attr)) {                                                                      \
-      return Status(ONNXRUNTIME, FAIL, "Attibute name and type don't match");                      \
+      return Status(ONNXRUNTIME, FAIL, "Attribute name and type don't match");                     \
     } else {                                                                                       \
       *value = static_cast<T>(attr->type());                                                       \
       return Status::OK();                                                                         \
@@ -114,7 +114,7 @@ inline constexpr int ArrayTypeToAttributeType<std::string>() {
       return Status(ONNXRUNTIME, FAIL, "No attribute with this name is defined.");                           \
     }                                                                                                        \
     ORT_RETURN_IF(values.size() != static_cast<size_t>(attr->list##_size()),                                 \
-       "GetAttrs failed. Expect values.size()=" , (attr->list##_size()) , ", got " , values.size());         \
+                  "GetAttrs failed. Expect values.size()=", (attr->list##_size()), ", got ", values.size()); \
     for (int i = 0; i < attr->list##_size(); ++i) {                                                          \
       values[i] = static_cast<T>(attr->list(i));                                                             \
     }                                                                                                        \

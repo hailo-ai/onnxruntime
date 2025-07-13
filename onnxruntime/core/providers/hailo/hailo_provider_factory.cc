@@ -6,6 +6,7 @@
 #include "core/providers/shared_library/provider_api.h"
 #include "core/providers/hailo/hailo_provider_factory.h"
 #include "hailo_execution_provider.h"
+#include "hailo_provider_factory_creator.h"
 
 using namespace onnxruntime;
 
@@ -36,6 +37,9 @@ struct Hailo_Provider : Provider {
 
     void Shutdown() override {
         Shutdown_DeleteRegistry();
+    }
+
+    void Initialize() override {
     }
 
 } g_provider;
