@@ -5,7 +5,7 @@ Hailo ONNX Runtime integrates ONNX Runtime with HailoRT to enable Hailo-EP, prov
 * ONNX Runtime version 1.14.1 with Python 3.7 and above
 
 # Prerequisites
-* HailoRT v4.22.0
+* HailoRT v4.23.0
 
 # Build Instructions
 To build ONNXRuntime with HailoRT please follow the following steps:
@@ -24,7 +24,7 @@ To run your ONNX model on ONNXRuntime with Hailo execution provider, follow the 
 * C++
 
     The file [hailo_basic_test](./../onnxruntime/test/providers/hailo/hailo_basic_test.cc) contains basic tests that run with Hailo-EP.
-    
+
     The ONNX models used in these tests are located in [testdata/hailo directory](./../onnxruntime/test/testdata/hailo/).
     To run the tests, do the following:
     * Compile onnxruntime with Hailo
